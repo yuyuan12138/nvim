@@ -39,12 +39,6 @@ vim.opt.showcmd = true           -- 显示命令
 vim.opt.ruler = true             -- 显示光标位置
 vim.opt.laststatus = 2           -- 总是显示状态栏
 
-vim.o.guicursor = table.concat({
-    "n-v-c:block-Cursor/lCursor-blinkwait1000-blinkon100-blinkoff100",
-    "i-ci:ver25-Cursor/lCursor-blinkwait1000-blinkon100-blinkoff100",
-    "r:hor50-Cursor/lCursor-blinkwait100-blinkon100-blinkoff100"
-  }, ",")
-  
 
 -- ========= buffer line
 vim.opt.termguicolors = true
