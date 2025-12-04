@@ -24,6 +24,7 @@ vim.opt.backspace = 'indent,eol,start' -- 改进退格键
 vim.opt.encoding = 'utf-8'
 vim.opt.fileencoding = 'utf-8'
 vim.opt.fileformats = 'unix,dos' -- 支持 Unix/Windows 换行符
+vim.opt.colorcolumn = '120'
 
 -- ================== 搜索 =================n
 vim.opt.ignorecase = true        -- 忽略大小写
@@ -43,4 +44,3 @@ vim.opt.laststatus = 2           -- 总是显示状态栏
 -- ========= buffer line
 vim.opt.termguicolors = true
 
--- vim.cmd([[colorscheme tokyonight]])
