@@ -44,3 +44,4 @@ vim.opt.laststatus = 2           -- 总是显示状态栏
 -- ========= buffer line
 vim.opt.termguicolors = true
 
+vim.g.mapleader = " "
