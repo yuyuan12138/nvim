@@ -8,7 +8,11 @@ local M = {
 
 M.servers = {
 	"rust_analyzer",
-	"clangd"
+	"clangd",
+    "pyright",
+    "html",
+    "cssls",
+    "ts_ls"
 }
 
 function M.config()
