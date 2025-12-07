@@ -19,4 +19,3 @@ vim.keymap.set('n', '<leader>ff', builtin.find_files, { desc = 'Telescope find f
 
 vim.keymap.set("n", "gd", vim.lsp.buf.definition)
 
-vim.keymap.set('n', '<F2>', ':CompetiTest receive testcases<CR>')
