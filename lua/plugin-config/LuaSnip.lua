@@ -6,12 +6,18 @@ local M = {
 }
 
 function M.config() 
-    require("luasnip.loaders.from_vscode").lazy_load ({
+    local ls_vscode = require("luasnip.loaders.from_vscode")
 
-    })
-    require("luasnip.loaders.from_vscode").load_standalone({
-        path="~/.config/nvim/code-snippets/acm.code-snippets"
-    })
+    ls_vscode.lazy_load()
+
+    for _, file in ipairs({
+        "acm.code-snippets",
+        "python.code-snippets",
+    }) do
+        ls_vscode.load_standalone({
+            path = vim.fn.expand("~/.config/nvim/code-snippets/" .. file),
+        })
+    end
 end
 
 
