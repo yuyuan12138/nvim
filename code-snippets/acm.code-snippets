@@ -1,0 +1,43 @@
+{
+	"multiple_test": {
+		"prefix": ["multiple_test"],
+		"body": [
+			"#include <bits/stdc++.h>",
+            "",
+            "void solve() {",
+            "\t$0",
+            "\treturn ;",
+            "}",
+            "",
+            "int main() {",
+            "    std::ios::sync_with_stdio(false);",
+            "    std::cin.tie(nullptr);",
+            "",
+            "\tint t;",
+            "\tstd::cin >> t;",
+            "\twhile (t--) {",
+            "\t\tsolve();",
+            "\t}",
+            "",
+            "\treturn 0;",
+            "}"
+		],
+        "scope": "cpp"
+	},
+    "single_test": {
+		"prefix": ["single_test"],
+		"body": [
+			"#include <bits/stdc++.h>",
+            "",
+            "int main() {",
+            "    std::ios::sync_with_stdio(false);",
+            "    std::cin.tie(nullptr);",
+            "",
+            "\t$0",
+            "",
+            "\treturn 0;",
+            "}"
+		]
+        "scope": "cpp"
+    }
+}
