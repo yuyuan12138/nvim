@@ -11,8 +11,7 @@ M.servers = {
 	"clangd",
     "pyright",
     "html",
-    "cssls",
-    "ts_ls"
+    "cssls"
 }
 
 function M.config()
