@@ -9,15 +9,8 @@ function M.config()
     local ls_vscode = require("luasnip.loaders.from_vscode")
 
     ls_vscode.lazy_load()
+    ls_vscode.load_standalone({ path = "/Users/yuyuan/cp/Wlib/cpp.code-snippets"})
 
-    for _, file in ipairs({
-        "acm.code-snippets",
-        "python.code-snippets",
-    }) do
-        ls_vscode.load_standalone({
-            path = vim.fn.expand("~/.config/nvim/code-snippets/" .. file),
-        })
-    end
 end
 
 

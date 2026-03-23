@@ -14,8 +14,8 @@ vim.opt.compatible = false       -- 关闭兼容模式
 vim.opt.syntax = 'on'            -- 开启语法高亮
 vim.opt.number = true            -- 显示行号
 vim.opt.relativenumber = true    -- 显示相对行号
-vim.opt.tabstop = 4              -- Tab 宽度
-vim.opt.shiftwidth = 4         -- 缩进宽度
+vim.opt.tabstop = 2              -- Tab 宽度
+vim.opt.shiftwidth = 2         -- 缩进宽度
 vim.opt.expandtab = true         -- Tab 转空格
 vim.opt.autoindent = true        -- 自动缩进
 vim.opt.smartindent = true       -- 智能缩进
@@ -25,6 +25,7 @@ vim.opt.encoding = 'utf-8'
 vim.opt.fileencoding = 'utf-8'
 vim.opt.fileformats = 'unix,dos' -- 支持 Unix/Windows 换行符
 vim.opt.colorcolumn = '120'
+vim.opt.splitright = true
 
 -- ================== 搜索 =================n
 vim.opt.ignorecase = true        -- 忽略大小写
