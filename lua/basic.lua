@@ -3,6 +3,54 @@ vim.g.loaded_netrw = 1
 vim.g.loaded_netrwPlugin = 1
 
 -- optionally enable 24-bit colour
+local function remove_bold(group)
+  local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+  if not ok or not hl then
+    return
+  end
+  hl.bold = false
+  vim.api.nvim_set_hl(0, group, hl)
+end
+
+vim.api.nvim_create_autocmd("ColorScheme", {
+  pattern = "unokai",
+  callback = function()
+    local groups = {
+      "Normal",
+      "NormalFloat",
+      "Comment",
+      "Constant",
+      "Identifier",
+      "Statement",
+      "PreProc",
+      "Type",
+      "Special",
+      "Underlined",
+      "Todo",
+      "Function",
+      "Keyword",
+      "Conditional",
+      "Repeat",
+      "Operator",
+      "Exception",
+      "Title",
+      "Label",
+      "StorageClass",
+      "Structure",
+      "Tag",
+      "Delimiter",
+      "Boolean",
+      "Number",
+      "String",
+    }
+
+    for _, group in ipairs(groups) do
+      remove_bold(group)
+    end
+  end,
+})
+
+vim.cmd("colorscheme unokai")
 vim.opt.termguicolors = true
 -- 设置默认文件格式为 Unix (LF)
 vim.opt.fileformat = "unix"
@@ -14,9 +62,18 @@ vim.opt.compatible = false       -- 关闭兼容模式
 vim.opt.syntax = 'on'            -- 开启语法高亮
 vim.opt.number = true            -- 显示行号
 vim.opt.relativenumber = true    -- 显示相对行号
-vim.opt.tabstop = 2              -- Tab 宽度
-vim.opt.shiftwidth = 2         -- 缩进宽度
+vim.opt.tabstop = 4              -- Tab 宽度
+vim.opt.shiftwidth = 4      -- 缩进宽度
 vim.opt.expandtab = true         -- Tab 转空格
+vim.api.nvim_create_autocmd("FileType", {
+  group = augroup,
+  pattern = { "c", "cpp" },
+  callback = function()
+    vim.bo.shiftwidth = 2
+    vim.bo.tabstop = 2
+    vim.bo.expandtab = false
+  end,
+})
 vim.opt.autoindent = true        -- 自动缩进
 vim.opt.smartindent = true       -- 智能缩进
 vim.opt.wrap = false             -- 不自动换行
