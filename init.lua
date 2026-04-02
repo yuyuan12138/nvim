@@ -1,8 +1,10 @@
 -- init.lua
 -- basic
-require('basic')
+require('config.basic')
 -- plugins
-require('plugins')
+require('config.plugins')
 -- keybindings
-require('keybindings')
+require('config.keybindings')
+require("config.lang-specific")
+require("config.template").setup()
 

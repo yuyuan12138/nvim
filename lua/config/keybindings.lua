@@ -5,6 +5,7 @@ vim.keymap.set('v', 'J', ":move '>+1<CR>gv-gv", opt)
 vim.keymap.set('v', 'K', ":move '<-2<CR>gv-gv", opt)
 vim.keymap.set('v', 'p', '"_dP', opt)
 vim.keymap.set('i', 'jk', '<ESC>', opt)
+vim.keymap.set('n', '<C-e>', '5<C-e>', opt)
 
 -- Competitive Programming
 vim.keymap.set('n', '<F5>', ":w | :!g++ sol.cpp -o sol -std=c++23 -Wall -O2<CR>", opt)
