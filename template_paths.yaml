@@ -1,0 +1,9 @@
+# Template search paths
+# Add directories to search for template files
+paths:
+  - ~/.config/nvim/templates
+  - ~/cp/Wlib
+
+# File suffixes recognized as templates
+suffixes:
+  - .tpl
