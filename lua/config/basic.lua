@@ -1,7 +1,4 @@
--- disable netrw at the very start of your init.lua
-vim.g.loaded_netrw = 1
-vim.g.loaded_netrwPlugin = 1
-
+vim.g.mapleader = " "
 -- optionally enable 24-bit colour
 local function remove_bold(group)
   local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
