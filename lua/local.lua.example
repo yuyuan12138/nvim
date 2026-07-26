@@ -1,0 +1,4 @@
+-- Copy this file to lua/local.lua for machine-specific settings.
+-- Example:
+-- vim.opt.guifont = "Your Font:h13"
+-- vim.g.python3_host_prog = "/absolute/path/to/python"

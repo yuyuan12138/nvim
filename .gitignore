@@ -1,0 +1,13 @@
+# Third-party checkouts and downloaded toolchains are build outputs.
+pack/vendor/opt/*
+!pack/vendor/opt/.gitkeep
+tools/*
+!tools/.gitkeep
+
+# Generated offline archives.
+*.tar.gz
+*.zip
+
+# Machine-specific settings.
+lua/local.lua
+.DS_Store
