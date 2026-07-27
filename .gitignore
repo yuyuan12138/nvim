@@ -11,3 +11,6 @@ tools/*
 # Machine-specific settings.
 lua/local.lua
 .DS_Store
+
+# Profiling
+profile
