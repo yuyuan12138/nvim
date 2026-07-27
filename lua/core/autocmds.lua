@@ -56,7 +56,3 @@ vim.api.nvim_create_autocmd("BufWritePre", {
   end,
 })
 
-vim.api.nvim_create_autocmd("BufNewFile", {
-  pattern = "sol.cpp",
-  command = "0r ~/.config/nvim/templates/cp.tpl"
-})
