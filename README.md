@@ -163,6 +163,66 @@ ESLint and Stylelint are run only when a matching project configuration file exi
 | `[d` / `]d` | Previous / next diagnostic |
 | `<Space>dd` | Diagnostic details |
 
+## C and C++ clangd flags
+
+`clangd` gets include paths, macros, language standards, and other parser state
+from the same compile flags your compiler sees. Prefer a project-generated
+`compile_commands.json` when possible. For small projects, add a project-local
+`.clangd` file:
+
+```yaml
+CompileFlags:
+  Add:
+    - -I/opt/homebrew/include
+    - -D_GNU_SOURCE
+    - -pthread
+```
+
+Use flags that affect compilation or preprocessing, such as `-I`, `-isystem`,
+`-D`, `-include`, `-std`, and `-pthread`. Linker-only flags such as `-lreadline`
+usually do not help `clangd` find headers or macros; add the library's include
+directory and required defines instead.
+
+For machine-wide fallback flags used only when a C/C++ project has no
+`compile_commands.json` or `compile_flags.txt`, put this in `lua/local.lua`:
+
+```lua
+vim.g.portable_clangd_fallback_flags = {
+  "-I/opt/homebrew/include",
+  "-I/usr/local/include",
+  "-D_GNU_SOURCE",
+  "-pthread",
+}
+```
+
+To generate a compilation database from inside Neovim, run:
+
+```vim
+:ClangdGenCompileCommands
+```
+
+For a CMake project, this runs:
+
+```sh
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+```
+
+Then it links or copies `build/compile_commands.json` to the project root when
+the root does not already have `compile_commands.json`. Use
+`:ClangdGenCompileCommands!` to replace an existing root-level
+`compile_commands.json` or symlink.
+
+For a Makefile project, the command requires `bear` and runs:
+
+```sh
+bear -- make
+```
+
+Additional command arguments are passed through, for example
+`:ClangdGenCompileCommands -DCMAKE_BUILD_TYPE=Debug` for CMake configure flags
+or `:ClangdGenCompileCommands clean all` for Make targets. After successful
+generation, the current project's `clangd` client is restarted.
+
 ## Machine-specific overrides
 
 Copy the example file:
@@ -187,4 +247,3 @@ This refreshes plugins and Mason packages, then creates a new archive. The remot
 ## Ruff and Python 3.14
 
 Ruff is downloaded as an official standalone native executable. It is deliberately not installed through Mason/Python, so the build does not depend on `venv`, `pip`, or `ensurepip`.
-

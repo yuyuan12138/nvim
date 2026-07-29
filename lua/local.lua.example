@@ -2,3 +2,14 @@
 -- Example:
 -- vim.opt.guifont = "Your Font:h13"
 -- vim.g.python3_host_prog = "/absolute/path/to/python"
+
+-- Extra flags for clangd when a C/C++ project has no compile_commands.json
+-- or compile_flags.txt. Prefer project-local .clangd files for project-specific
+-- flags. These should be compile/preprocessor flags such as -I, -isystem, -D,
+-- -include, -std, or -pthread; -l linker flags usually do not affect LSP parsing.
+-- vim.g.portable_clangd_fallback_flags = {
+--   "-I/opt/homebrew/include",
+--   "-I/usr/local/include",
+--   "-D_GNU_SOURCE",
+--   "-pthread",
+-- }

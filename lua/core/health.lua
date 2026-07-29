@@ -72,6 +72,11 @@ function M.setup()
       "taplo",
       "marksman",
     })
+    add_tools(lines, "Compilation database tools", {
+      "cmake",
+      "bear",
+      "make",
+    })
     add_tools(lines, "Linters", {
       "ruff",
       "selene",
