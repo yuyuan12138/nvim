@@ -1,0 +1,837 @@
+-- lua/tuna/config.lua
+--
+-- Configuration layering:
+--   defaults  →  user opts (passed to setup())  →  local per-directory config
+--
+-- `current_setup` is the defaults until `setup()`, which is optional, merges the user's
+-- options over them. Local configuration (a `.tuna.lua` file found by walking up
+-- the directory tree from a buffer's file) is applied lazily, per buffer, on
+-- top of `current_setup` and cached in `buffer_configs`.
+
+local utils = require("tuna.utils")
+
+local M = {}
+
+---Default configuration.
+M.defaults = {
+    -- name of the per-directory config file, searched upward from each file
+    local_config_file_name = ".tuna.lua",
+
+    -- save behaviour before running
+    save_current_file = true, -- write the solution's buffer
+    save_all_files = false, -- write every modified buffer
+
+    -- `compile_command` and `run_command` are per filetype, `{ exec, args }`: the program and
+    -- its argument list, not a shell line, so nothing is word-split or glob-expanded. A
+    -- filetype with no `compile_command` entry is run without compiling (Python), and one
+    -- with no `run_command` entry is not run at all.
+
+    -- compilation
+    -- where the compiler runs: relative to the source file's directory, or absolute to keep
+    -- binaries out of the problem folder
+    compile_directory = ".",
+    compile_command = {
+        c = { exec = "gcc", args = { "-Wall", "$(FNAME)", "-o", "$(FNOEXT)" } },
+        cpp = { exec = "g++", args = { "-Wall", "$(FNAME)", "-o", "$(FNOEXT)" } },
+        rust = { exec = "rustc", args = { "$(FNAME)" } },
+        java = { exec = "javac", args = { "$(FNAME)" } },
+    },
+
+    -- running
+    running_directory = ".", -- where the solution and its helpers run, read like `compile_directory`
+    run_command = {
+        c = { exec = "./$(FNOEXT)" },
+        cpp = { exec = "./$(FNOEXT)" },
+        rust = { exec = "./$(FNOEXT)" },
+        python = { exec = "python3", args = { "$(FNAME)" } },
+        java = { exec = "java", args = { "$(FNOEXT)" } },
+    },
+    multiple_testing = -1, -- testcases to run at once: -1 = CPU count, 0 = all, n = n
+    maximum_time = 5000, -- per-process time limit in ms (process is killed past it)
+    -- "exact" | "squish" | { "float", tol = 1e-6 } | the name of one of your own
+    -- (`compare_methods`). "float" compares token-wise, accepting numeric tokens within
+    -- `tol` absolute or relative error (non-numeric tokens must match exactly) — for
+    -- problems with floating-point answers, no custom checker needed.
+    output_compare_method = "squish",
+    -- Comparison methods of your own, by name: { name = function(output, expected) ->
+    -- boolean }. A name is used like a builtin one, here and in `:Tuna compare`; a
+    -- builtin's own name always means the builtin.
+    compare_methods = {},
+    -- Special judge. Like every helper, discovered by default: a sibling `checker.*` file
+    -- (see tool_names) judges when there is one, plain comparison via
+    -- output_compare_method otherwise. Set it to use a checker of your own instead:
+    --   a path string        -> a checker file, compiled and run by its language, or a
+    --                           prebuilt binary
+    --   { exec, args } table -> a command; args expand $(FNOEXT) etc. and keep
+    --                           $(INPUT)/$(OUTPUT)/$(ANSWER) for each testcase, and a
+    --                           command with no args is handed those three
+    -- Checkers are testlib-style, `checker <input> <output> <answer>`, exit 0 meaning
+    -- correct, which is how problems with several valid outputs are judged.
+    -- `:Tuna checker off` compares outputs for one problem regardless.
+    checker = nil,
+
+    -- Helper programs (checker / generator / bruteforce / interactor) for the
+    -- stress / interactive / special-judge run modes are discovered by convention:
+    -- a sibling source file whose *base name* matches one of these (any extension),
+    -- compiled and run with the same commands as a solution of that language. This
+    -- is what lets you switch run modes with no .tuna.lua — just drop the file in.
+    -- A solution is any other runnable file: its names are the ones a helper prefers
+    -- when it looks for its solution, and the first is what a new one is called in a
+    -- folder with none (`:Tuna scaffold solution`).
+    tool_names = {
+        solution = { "main", "sol", "solution" },
+        checker = { "checker", "check" },
+        generator = { "gen", "generator" },
+        bruteforce = { "brute", "bruteforce", "reference" },
+        interactor = { "interactor", "interact" },
+    },
+
+    -- stress testing (:Tuna run stress) — hunt for an input where the solution and
+    -- a trusted bruteforce disagree. generator/bruteforce are discovered by
+    -- convention (gen.* / brute.*); set these to use your own instead: a path to
+    -- a helper file (compiled and run by its language, or a prebuilt binary), or an
+    -- { exec, args } command, expanded with the usual $(FNOEXT)/$(ABSDIR)/… modifiers.
+    -- A helper set here counts as present, as a file beside the solution does.
+    -- The generator gets a seed appended (unless pass_seed = false): a number new for
+    -- every run plus the iteration, so each run tries new inputs, and the Run pane shows
+    -- the seed of the one being tried, to reproduce it.
+    stress = {
+        -- override discovery, e.g. { exec = "python3", args = { "$(ABSDIR)/gen.py" } }; also
+        -- the one `:Tuna testcase generate` runs
+        generator = nil,
+        bruteforce = nil, -- override discovery: a correct-but-slow solution
+        count = 100, -- maximum generator iterations before giving up
+        pass_seed = true, -- append the seed as the generator's last argument, when generating too
+        -- How many counterexamples a single `:Tuna run stress` may save before it
+        -- stops, and the hard cap on the total number of testcases stress will let
+        -- accumulate on disk. The search stops as soon as either is reached; each
+        -- saved counterexample is appended as a normal testcase (so it becomes a
+        -- regression test). Both are surfaced live in the stress runner UI.
+        saves_per_run = 1, -- counterexamples to save per run before stopping
+        max_saved = 10, -- never grow the testcase set beyond this many total
+        -- How long the bruteforce may take on one generated input, in milliseconds.
+        -- It has its own budget because a bruteforce is slow on purpose, and every
+        -- verdict is read off its output, so `maximum_time` (what the solution is
+        -- held to) would stop the search on inputs the bruteforce simply needs
+        -- longer for. Running past it stops the search. `false` (or 0) lets it run as
+        -- long as it likes.
+        bruteforce_time = 20000,
+    },
+
+    -- interactive problems (:Tuna run interactive [live|feed|interactor]) — the
+    -- solution talks to the other side over stdio, turn by turn. Three sources:
+    --   * live       — YOU are the other side: type into the (editable) Input pane,
+    --                  each <CR> line is sent to the solution; no auto-verdict.
+    --   * feed       — the testcase input plays the other side, one line per turn;
+    --                  judged against the expected output if present.
+    --   * interactor — a written interactor.* program decides the verdict (exit 0 =
+    --                  AC). Secondary: auto-used only when an interactor.* exists.
+    -- The chosen source is remembered per problem, so a later bare `:Tuna run`
+    -- repeats it. `interactor` below overrides interactor discovery; it receives the
+    -- testcase input/answer via $(INPUT)/$(ANSWER) (default: those two files appended
+    -- as args).
+    interactive = {
+        -- override discovery, e.g. { exec = "python3", args = { "$(ABSDIR)/interactor.py" } }
+        interactor = nil,
+        -- The grid each source draws, in the shape `popup_ui.layout` takes: a nested
+        -- `{ ratio, pane }` tree over `tc`, `so`, `eo`, `si`, `se`. `live` and `interactor`
+        -- read as a conversation, so they default to the selector beside Output, Live and
+        -- Errors, with no Expected Output — there is no one right answer to compare against.
+        -- `feed` replays a stored testcase, so it keeps the grid you configured for a run.
+        -- `false` means exactly that: whatever `popup_ui.layout` (or `split_ui`) says.
+        -- In `live` you type into `si`, so a layout without it leaves nowhere to talk.
+        layouts = {
+            live = { { 3, "tc" }, { 3, "so" }, { 3, "si" }, { 2, "se" } },
+            interactor = { { 3, "tc" }, { 3, "so" }, { 3, "si" }, { 2, "se" } },
+            feed = false,
+        },
+    },
+
+    -- scaffolding (:Tuna scaffold <solution|checker|generator|bruteforce|interactor> [ext])
+    -- and every solution a download or `:Tuna scratch` writes. `templates` names the
+    -- template files: a path, an ordered list of paths, or a table by role,
+    --   { solution = { "~/cp/template.$(JUDGE).$(FEXT)", "~/cp/template.$(FEXT)" },
+    --     ["*"] = "~/cp/scaffolds/$(ROLE).$(FEXT)", checker = false }
+    -- where `["*"]` stands for every role not listed and `false` means an empty file.
+    -- Paths take the file modifiers, `$(ROLE)`, `$(FEXT)` (the language being written)
+    -- and, when the problem is known, the download ones. The first that exists wins,
+    -- else tuna's own starter (its `scaffolds/` folder). A template is for the language
+    -- its extension names, and the modifiers in it are filled in where they can be.
+    -- `language` writes every helper in one language (an extension, "py") instead of
+    -- the solution's.
+    scaffold = {
+        templates = vim.fn.stdpath("config") .. "/tuna/scaffolds/$(ROLE).$(FEXT)",
+        language = nil,
+    },
+
+    -- clean (:Tuna clean) — remove created-but-unused files.
+    clean = {
+        -- Safety rail for a scan pointed at a huge tree (a whole home directory holds
+        -- hundreds of thousands of entries). The walk stops after this many filesystem
+        -- entries and reports that it was cut short, rather than blocking the editor.
+        max_entries = 20000,
+        -- Directories never descended into: build outputs, dependency trees and the
+        -- like hold no solutions and dwarf everything else. Dot-directories (`.git`,
+        -- `.cache`, …) are always skipped as well, since their files are never
+        -- candidates anyway.
+        skip_directories = { "node_modules", "target", "build", "dist", "vendor", "__pycache__", "venv" },
+        -- Extra directories never offered for deletion, on top of the ones protected
+        -- unconditionally: the scanned root, the cwd, the directory the command was
+        -- launched from, every root configured here, the home directory with its
+        -- standard sub-directories (`Desktop`, `Documents`, … — read from
+        -- `user-dirs.dirs` when present, so localized names count too) and the system's
+        -- own directories (`/`, `/usr`, `/tmp`, …). An emptied protected directory is
+        -- left alone, and so is every directory above it.
+        protected_directories = {},
+    },
+
+    -- The per-problem sidecar (`sidecar.lua`): what tuna knows about a problem and
+    -- can't recover from the source — the downloaded task's url/name/group, the last
+    -- submit verdict and the last run's local verdict per file, and the per-file run state (`:Tuna compare`, the
+    -- checker setting, the chosen run mode / interactive source). Written beside the
+    -- solution so it travels with the problem and `:Tuna clean` disposes of it along
+    -- with it.
+    problem_store_file = ".tuna.json",
+
+    -- testcase storage (the on-disk layout is fully customizable)
+    -- Where testcases live. Evaluated for file modifiers, then used as an absolute
+    -- path when it is one and taken relative to the source file when it is not — so
+    -- `"."` keeps them beside the source, `"tests"` puts them in a sub-directory, and
+    -- `"$(HOME)/cp/testcases/$(DIRNAME)"` keeps them out of the source tree entirely.
+    -- An absolute path needs a per-problem component (`$(DIRNAME)` — the name of the
+    -- problem's own directory — or `$(FNOEXT)`): the storage backends name their files
+    -- after the source, so problems sharing one directory overwrite each other.
+    testcases_directory = ".",
+    testcases_storage = "files", -- "files" | "single_file" | "directory"
+    testcases_auto_detect_storage = true, -- if the chosen mode finds nothing, try the others
+    -- "single_file" mode: one msgpack-encoded file
+    testcases_single_file_format = "$(FNOEXT).testcases",
+    -- "files" mode: a pair of text files per testcase. Either a single format
+    -- string or an ordered list of them. On load, formats are tried in order and
+    -- the first that discovers any testcase wins (no merging across formats, so a
+    -- folder holding two problems' per-source testcases never cross-contaminates).
+    -- The first entry is canonical: new testcases are written with it. The default
+    -- picks up the source-named pair first, then a shared, un-prefixed `input<N>.txt`
+    -- so any solution in a folder can run testcases it didn't create (e.g. run all
+    -- versions, or CC-downloaded testcases whose source name differs).
+    -- A format without `$(TCNUM)` (e.g. `out.txt`) names a single testcase (index 0),
+    -- and a testcase may have only an output (it runs with empty stdin).
+    testcases_input_file_format = { "$(FNOEXT)_input$(TCNUM).txt", "input$(TCNUM).txt", "in.txt" },
+    -- the answers, paired with the input formats by position
+    testcases_output_file_format = { "$(FNOEXT)_output$(TCNUM).txt", "output$(TCNUM).txt", "out.txt" },
+    -- "directory" mode: one sub-directory per testcase holding input/output files
+    testcases_directory_format = "tests/$(TCNUM)",
+    testcases_directory_input = "input.txt", -- the input's file name in each testcase's directory
+    testcases_directory_output = "output.txt", -- the answer's
+
+    -- `:Tuna testcase split <n> [marker]` — the marker a testcase's cases are bracketed
+    -- with when you have marked them yourself. A line made only of this character (any
+    -- number of them, so both `-` and `----` work) is a marker, in the input and in the
+    -- expected output alike, and they come in **pairs**: one opens a case and the next
+    -- closes it. What a pair brackets becomes a testcase verbatim; everything outside
+    -- every pair stays together as one. Nothing is a case without having been bracketed
+    -- on both sides, so a stray marker cannot quietly turn half a file into a testcase.
+    testcases_split_markers = "-",
+
+    -- download (Competitive Companion integration)
+    companion_port = 27121, -- the port Competitive Companion posts to
+    download_print_message = true, -- report each problem as it is downloaded
+    -- open the listener at startup and leave it open (`:Tuna download persistently`)
+    start_downloading_persistently_on_setup = false,
+    -- Per-judge parsing of Competitive Companion's `task.group` ("Judge - Contest")
+    -- into the $(JUDGE)/$(CONTEST) modifiers. Add a parser for a new judge, override
+    -- a built-in, or disable one with `false`. A parser gets
+    -- `{ judge, contest, group, task }` and returns overrides (nil fields kept):
+    --   judge_parsers = {
+    --     codechef = function(ctx) return { contest = ctx.contest:match("%((.-)%)") } end,
+    --     codeforces = false,               -- keep Codeforces' raw contest name
+    --     ["*"] = function(ctx) ... end,     -- catch-all for judges with no parser
+    --   }
+    -- Codeforces and AtCoder have built-in defaults (see `judges.lua`).
+    judge_parsers = {},
+    -- Where the cursor lands whenever tuna opens a solution itself: a downloaded problem or
+    -- contest, a problem stepped onto with `:Tuna next`/`prev`, one reopened with
+    -- `:Tuna go` or from the menu's recent and pinned lists, a new solution of
+    -- `:Tuna scaffold solution`, and the scratch file of `:Tuna scratch`. Templates
+    -- open on their header, which is never where one starts typing.
+    --   false                          leave the cursor at the top
+    --   <number>                       that line
+    --   "<lua pattern>"                the first line matching it
+    --   { pattern = …, offset = <n> }  n lines below that match
+    --   function(bufnr)                -> line number
+    -- The default lands on the first line of a `solve` function (`void solve() {`,
+    -- `def solve():`), as in tuna's own starters. A pattern that matches nothing leaves
+    -- the cursor alone, so one written for a given language does no harm in another.
+    template_cursor = { pattern = "^%a[%w_ ]* solve%(", offset = 1 },
+    -- How tuna changes Neovim's directory when it takes you somewhere — `:Tuna go
+    -- problem` / `:Tuna go contest`, `:Tuna next` / `:Tuna prev` when it was the
+    -- problem being left, and a freshly downloaded contest (see
+    -- `cd_downloaded_contests`): "cd" (global), "tcd" (this tab), "lcd" (this window),
+    -- or false to go to the file without touching the directory. Global by default, so
+    -- everything else — `:e`, a fuzzy finder, `:Tuna run all` from a scratch buffer —
+    -- follows you to the problem too.
+    cd_command = "cd",
+    -- `:Tuna scratch` — a scratch solution to start writing in before the problem exists
+    -- (typing during the countdown, then folding the code into the real file with
+    -- `:Tuna download sync` once the contest is downloaded). The scratch is the
+    -- template minus its modifier header, since that header can only be filled in by
+    -- a real problem. `file` is where it lives; `download` is what `sync` fetches.
+    scratch = {
+        file = vim.fn.stdpath("cache") .. "/tuna_scratch.$(FEXT)",
+        extension = "cpp", -- language of the scratch when no solution buffer says otherwise
+        download = "contest", -- "contest" | "problem"
+    },
+
+    -- menu (bare `:Tuna`)
+    menu = {
+        -- The banner across the top: a list of lines to draw instead of the shipped
+        -- wordmark, or `false` for none. It is an ornament and is dropped automatically
+        -- when the editor is too small to hold it and the lists both.
+        header = nil,
+    },
+
+    -- `:Tuna go` and the menu: how many problems and contests are remembered, most
+    -- recent first. The menu lists them all, and a list too long to fit scrolls.
+    recent = {
+        problems = 5,
+        contests = 3,
+        -- Directories (absolute or `~/…` paths) whose files are never remembered as
+        -- problems or contests, however they are opened or downloaded, and forgotten if
+        -- they were before: a snippet library tested with tuna, a folder of experiments.
+        -- `:Tuna pin` still works there, a pin being asked for.
+        ignored_directories = {},
+    },
+
+    -- `:Tuna lib` — copy a piece of your own algorithm library into the current file.
+    -- `path` is where that library lives (a directory, or a list of them); only files
+    -- with the current file's extension are offered, so a C++ problem gets the C++
+    -- library. Nothing has to be maintained in a special format: mark the parts worth
+    -- copying, in place, with a pair of comments carrying `marker`:
+    --
+    --     // TUNALIB: binary exp start
+    --     ll bexp(ll n, ll m) { … }
+    --     // TUNALIB: binary exp end
+    --
+    -- Everything outside the guards (includes, `main`, scratch code) is ignored, and
+    -- the guards work in any language since they are recognized anywhere in a line. The
+    -- comment lines right under a start guard are the snippet's notes, shown beside it and
+    -- never inserted, and from a line starting `Complexity:` on, its complexity.
+    -- `:Tuna lib` lists every snippet, and every file with no guards whole, and narrows
+    -- the list as you type: names and files first, then notes, then code.
+    library = {
+        path = false, -- false | "~/cp/snippets" | { dir, dir, … }
+        marker = "TUNALIB",
+        depth = 5, -- how deep to search below each path
+        -- The picker's share of the editor, borders included. Unset, it follows the
+        -- runner UI's (`popup_ui`), the other board tuna draws over the editor.
+        width = nil,
+        height = nil,
+    },
+    -- Where downloads land, as paths built from the modifiers ($(JUDGE), $(CONTEST),
+    -- $(PROBLEM), …, see REFERENCE.md's Modifiers section), evaluated per problem.
+    date_format = "%c", -- the os.date format of $(DATE)
+    downloaded_files_extension = "cpp", -- the language new solutions are created in
+    downloaded_problems_path = "$(CWD)/$(PROBLEM).$(FEXT)", -- where a single problem is written
+    -- ask before writing a problem, the computed path filled in to accept or edit
+    downloaded_problems_prompt_path = true,
+    downloaded_contests_directory = "$(CWD)", -- a contest's own folder
+    downloaded_contests_problems_path = "$(PROBLEM).$(FEXT)", -- each problem, inside that folder
+    -- ask for a contest's directory, and for the language its files are created in
+    downloaded_contests_prompt_directory = true,
+    downloaded_contests_prompt_extension = true,
+    -- open what was written: the problem, or a contest's first problem
+    open_downloaded_problems = true,
+    open_downloaded_contests = true,
+    -- Move Neovim into a freshly downloaded problem's / contest's directory (via
+    -- `cd_command`). Downloading is the moment you start working there, and everything
+    -- that is not tuna — `:e`, a fuzzy finder, `:grep`, a terminal split — works from
+    -- the current directory, so without these you keep landing wherever the editor
+    -- started. Each is independent of its `open_downloaded_*`: which file to show and
+    -- where to work are separate questions. false leaves the directory alone.
+    -- (For a problem this is the directory holding the solution, which is the problem's
+    -- own only if `downloaded_problems_path` gives it one — the default
+    -- `$(CWD)/$(PROBLEM).$(FEXT)` writes into the current directory, so nothing moves.)
+    cd_downloaded_problems = true,
+    cd_downloaded_contests = true,
+    -- Testcases downloaded into a solution that already has some (`:Tuna download
+    -- testcases`): true replaces them without asking, false asks whether to keep them
+    -- alongside the new ones, replace them, or stop.
+    replace_downloaded_testcases = false,
+
+    -- submit (:Tuna submit) — hand the current solution to an external submit tool.
+    submit = {
+        -- "command" runs your submit tool; "browser" opens the judge's submit page and
+        -- copies the source to the clipboard (see `judges` below)
+        provider = "command",
+        -- The "command" provider expands this through the modifier engine (adds
+        -- $(URL)/$(LANG) to the usual $(FABSPATH)/$(FNAME)/…) and runs it in a
+        -- terminal. nil = submit is unconfigured (errors with a hint). Example:
+        --   command = 'cf submit "$(URL)" "$(LANG)" "$(FABSPATH)"',
+        command = nil,
+        -- How to find the problem URL: a Lua pattern scanned over the first
+        -- `url_scan_lines` header lines (first capture = URL), or a
+        -- function(ctx) -> string. Falls back to the per-problem sidecar below.
+        url = "submit at:%s*(%S+)",
+        url_scan_lines = 10,
+        -- The URL a problem is *identified* by is not always the one it is *submitted*
+        -- through, so `$(URL)` is resolved separately from the identity URL kept in the
+        -- sidecar. nil = tuna's built-in rules (`submit.builtin_url_rewrite`, currently
+        -- the Codeforces-mirror rule below); a `function(url, ctx) -> string?` to add
+        -- your own, returning nil to fall through to the built-ins; `false` to submit
+        -- through the identity URL unchanged. Same shape as `judge_parsers`. A function
+        -- that errors, or returns something that is no longer a valid URL, warns and is
+        -- ignored rather than quietly redirecting a submission. ctx = { bufnr,
+        -- filepath, cfg }.
+        --
+        -- Built in: Codeforces **mirrors** (m1/m2/m3.codeforces.com), which carry a
+        -- live round. They serve only the contest-wide `…/contest/<id>/submit` — the
+        -- per-problem `…/submit/<index>` that works on the main site 404s there, and no
+        -- URL preselects the problem, so you pick it from that page's dropdown.
+        url_rewrite = nil,
+        -- How long after downloading a problem from a mirror to keep submitting through
+        -- it, in seconds. A mirror carries a live round and drops the contest a day or
+        -- two later, redirecting to its homepage — so the routing has to expire, or a
+        -- submit eventually goes to a page that silently is not the submit page. This
+        -- is a clock rather than a check because there is nothing to check: Codeforces
+        -- answers every non-browser request with a JavaScript challenge, identical
+        -- whether or not the mirror still has the contest, so nothing tuna can send
+        -- tells the two apart. Being wrong is cheap in the safe direction — the
+        -- fallback is codeforces.com, which always works. false = never expire,
+        -- 0 = never use a mirror.
+        mirror_ttl_seconds = 24 * 60 * 60,
+        -- Optional header markers to backfill the sidecar's contest/name (like `url`
+        -- above) when a problem was set up outside the download flow. Each is a Lua
+        -- pattern scanned over the same header lines (first capture wins); nil to
+        -- disable. These match the labels the default template writes
+        -- (`// contest: …` / `// problem: …`); a downloaded problem's sidecar already
+        -- carries the authoritative values, so these only fill a missing field.
+        group = "contest:%s*(.-)%s*$",
+        name = "problem:%s*(.-)%s*$",
+        -- filetype -> the language name your submit tool expects
+        languages = { cpp = "C++", c = "C", python = "Python 3", java = "Java", rust = "Rust" },
+        terminal = "auto", -- "auto" (toggleterm if installed, else split) | "toggleterm" | "split"
+        terminal_direction = "vertical", -- terminal orientation: "vertical" | "horizontal"
+        reuse_terminal = true, -- keep one cached submit terminal across submits
+        -- Fire-and-forget path only (watch = false): whether to open and focus the
+        -- terminal on submit. false runs the command in the background (toggleterm
+        -- stays hidden / a hidden native buffer) without stealing focus — toggle it
+        -- open yourself to inspect output. true pops it open so output is visible.
+        open_terminal = true,
+        -- Watch mode: run the submit command as a tracked async job (no terminal),
+        -- parse its stdout for the judge verdict, and show it in the lualine
+        -- component — persistently, per solution buffer, until the next submit.
+        -- On by default: the tools people configure here (cf-tool, the Rust
+        -- `submitter`, kattis-cli with -f) poll the judge and print the verdict, and
+        -- reading it is the whole reason to submit from the editor. A tool that prints
+        -- nothing tuna recognises is not a failure — a clean exit clears the indicator
+        -- and says nothing — so the cost of this being wrong for your tool is a missing
+        -- verdict, not a wrong one.
+        --
+        -- Set false for the fire-and-forget terminal instead. That is the one to use for
+        -- a tool that **asks you something** (kattis-cli without -f prompts to confirm):
+        -- watch mode gives the child no stdin, so a prompt there gets EOF.
+        watch = true,
+        -- How long (ms) the terminal-path "submitting …" flash stays up (watch mode
+        -- ignores this — its state persists until the next submit). 0 disables it.
+        status_time = 6000,
+        -- Whether to read the submit tool's output for a verdict at all. false skips
+        -- the parsing for a tool that just submits and prints nothing useful, so a
+        -- stray "accepted" in its chatter can't be misread as the judge's word. A
+        -- *silent* run means the same either way: a clean exit with no verdict clears
+        -- the indicator rather than reporting a failure.
+        expects_verdict = true,
+        -- Watch-mode safety net (ms): if a submit job never reports a final verdict
+        -- within this long (a hung/abandoned poll), stop watching and clear the
+        -- indicator so it doesn't stick forever. The submission itself already
+        -- happened — this only stops polling. 0 disables.
+        watch_timeout = 120000,
+        -- Debug: if set to a file path, watch mode dumps each submission's raw
+        -- stdout/stderr (control codes intact) and the parsed verdict there, so a
+        -- misbehaving judge's exact output can be inspected. nil disables.
+        log_file = nil,
+        -- Verdict classifier for watch mode: ordered { lua_pattern, state } rules
+        -- matched (first wins) against each lowercased stdout status line. States
+        -- `accepted`/`rejected`/`partial` are final; `pending` keeps watching.
+        -- Unmatched lines are ignored (so "Submission url: …" etc. don't show).
+        verdicts = {
+            { "queued", "pending" },
+            { "in queue", "pending" },
+            { "testing", "pending" },
+            { "running", "pending" },
+            { "compiling", "pending" },
+            { "judging", "pending" },
+            { "pending", "pending" },
+            { "accepted", "accepted" },
+            { "pretests passed", "accepted" },
+            { "partial", "partial" },
+            { "wrong answer", "rejected" },
+            { "time limit", "rejected" },
+            { "memory limit", "rejected" },
+            { "cpu exhausted", "rejected" },
+            { "idleness limit", "rejected" },
+            { "runtime error", "rejected" },
+            { "compilation error", "rejected" },
+            { "denial of judgement", "rejected" },
+            { "challenged", "rejected" },
+            { "hacked", "rejected" },
+            { "skipped", "rejected" },
+            { "rejected", "rejected" },
+            -- "failed on test N" (not a bare "failed", which also appears in benign
+            -- warnings like "failed to save cookies")
+            { "failed on test", "rejected" },
+            { "crashed", "rejected" },
+            { "security", "rejected" },
+        },
+        -- state -> lualine color for the verdict. Each value is either a highlight
+        -- group name (its foreground is used; reuses tuna's runner groups) or a color
+        -- table like `{ fg = "#ff6c6b" }` to match your statusline palette exactly.
+        verdict_highlight = {
+            pending = "TunaWarning",
+            accepted = "TunaCorrect",
+            partial = "TunaWarning",
+            rejected = "TunaWrong",
+            error = "TunaWrong",
+        },
+        -- Per-judge overrides. The judge is derived from the submission URL's host
+        -- (atcoder.jp -> "atcoder", codeforces.com -> "codeforces", …). Each entry is
+        -- a partial `submit` table shallow-merged over the base above, so you can point
+        -- a judge at a different tool (and its own verdict/language/watch settings) or
+        -- a different `provider`, while everything else falls back to the defaults.
+        -- The built-in `browser` provider opens the judge's submit page in the browser
+        -- and copies the source to the clipboard — the only way to submit to judges
+        -- that gate submission behind a challenge no CLI can solve (AtCoder's
+        -- Cloudflare Turnstile). Example:
+        --   judges = {
+        --     atcoder = { provider = "browser" },
+        --   }
+        -- `command` may also be a `function(ctx) -> string` for fully custom dispatch.
+        judges = {},
+    },
+
+    -- Opt-in keymaps. Nothing is mapped unless you ask for it, in one of two ways.
+    --
+    -- `preset` takes the whole ready-made set under a prefix of your choosing:
+    --   keymaps = { preset = "<leader>t" }
+    -- giving <leader>tr run, <leader>tu show ui, <leader>tt{a,e,d} testcases,
+    -- <leader>ts submit, <leader>tn/tp next/previous problem, <leader>tm menu,
+    -- <leader>tw scratch + <leader>tds sync, and <leader>td{t,p,c} download
+    -- testcases/problem/contest (see keymaps.lua `M.preset`).
+    --
+    -- `mappings`/`global` map individual actions to a left-hand side (a string or a
+    -- list of them). They work on their own, and layer over `preset` when both are
+    -- given — mapping an action to `false` drops it from the preset. Actions mirror
+    -- the :Tuna subcommands (keymaps.lua `M.actions`). The two scopes:
+    --   * `mappings` — buffer-local, set on solution files (filetypes in `filetypes`)
+    --     via a FileType autocmd, so they follow you from one solution to the next.
+    --   * `global`   — always available, set once regardless of the current buffer
+    --     (for what you reach for when no solution is open: download, menu, …).
+    -- Example:
+    --   keymaps = {
+    --     preset   = "<leader>t",
+    --     mappings = { run = "<leader><leader>", delete_testcase = false },
+    --   }
+    keymaps = {
+        preset = false, -- false | prefix string, e.g. "<leader>t"
+        filetypes = { "c", "cpp", "rust", "java", "python" },
+        mappings = {},
+        global = {},
+    },
+
+    -- Every float's border, passed to nvim_open_win, and its highlight group, applied
+    -- through the window's `winhighlight` (FloatBorder remap), which the footer saying how
+    -- much of a pane is out of sight wears too.
+    floating_border = "rounded",
+    floating_border_highlight = "FloatBorder",
+    -- Plugin-wide keys to move focus between panes, in every UI with more than one: the
+    -- runner UI, the testcase editor, a menu and its preview, the `:Tuna clean` form and
+    -- the `:Tuna` menu. Tuna handles this itself so it works across floats, where the
+    -- built-in `<C-w>hjkl` can't reach. Given as { left, down, up, right }, and they work
+    -- while typing too.
+    switch_window_keys = { "<C-h>", "<C-j>", "<C-k>", "<C-l>" },
+    -- Plugin-wide keys that dismiss a floating widget (prompt, menu, chooser form, the
+    -- `:Tuna` menu's lists, testcase editor), bound in one place so the same press
+    -- means the same thing in all of them. The default `insert` list is empty on
+    -- purpose: `<Esc>` there leaves insert mode, as everywhere else in vim, so
+    -- cancelling something being typed into takes a second, deliberate press. Put
+    -- `"<Esc>"` in `insert` to have it cancel straight from insert mode instead.
+    -- (`<C-c>` is not worth listing under `insert`: Neovim handles `i_CTRL-C` itself
+    -- and never runs a mapping for it.) Per-widget keys (the testcase editor's `q`,
+    -- `picker_ui.mappings.close`) are added to these rather than replacing them.
+    cancel_keys = {
+        normal = { "<Esc>", "<C-c>" },
+        insert = {},
+    },
+    -- The standalone testcase editor (`:Tuna testcase add`/`edit`): input and expected
+    -- output side by side, together `width` × `height` of the editor, moved between with
+    -- `switch_window_keys` (left and right). As in the runner UI, `:w` saves, `:wq` and
+    -- `:x` save and close, and `q` or `cancel_keys` close, asking first about an edit not
+    -- saved.
+    editor_ui = {
+        width = 0.8,
+        height = 0.6,
+        show_nu = true, -- line numbers
+        show_rnu = false, -- relative line numbers
+    },
+    -- The keys of every list: the menus tuna asks its questions in, the `:Tuna clean` form,
+    -- the `:Tuna` menu and the runner UI's testcase list. `focus_next`/`focus_prev` move
+    -- one entry (a count moves that many), wrapping around at the ends, and `submit`/`close`
+    -- act in the menus and forms (`close` adds to `cancel_keys`).
+    picker_ui = {
+        mappings = {
+            focus_next = { "j", "<down>" },
+            focus_prev = { "k", "<up>" },
+            close = { "q", "Q" },
+            submit = "<cr>",
+        },
+    },
+    runner_ui = {
+        -- The grid drawn while the Compile row is the one on screen. The build step is not a
+        -- testcase — no input, no answer, nothing to compare — so its grid places only the
+        -- selector (`tc`) and one `build` cell, split into a pane per source the run compiles
+        -- (your solution, and a generator and a bruteforce, an interactor or a checker), each
+        -- named after it. This is the shape they are stacked in.
+        compile_layout = {
+            { 3, "tc" },
+            { 8, "build" },
+        },
+        -- Write the key that zooms each pane at the end of its title, e.g.
+        -- ` Errors (e) `. On the build row each source's pane shows its own key.
+        show_title_keys = true,
+        interface = "popup", -- "popup" | "split"
+        -- The border and title colour of the panes you can *type* into (Input and
+        -- Expected Output), so they read as different from the ones you can only read.
+        -- Any highlight group; `false` turns the accent off. The default `TunaEditable`
+        -- is a bold magenta — the one hue tuna doesn't already spend on verdicts — and
+        -- is defined with `default = true`, so a colorscheme that defines it wins.
+        -- Borders and titles are a floating-window thing, so this has no effect with
+        -- `interface = "split"`.
+        editable_border_highlight = "TunaEditable",
+        -- Line numbers in the selector (the testcase list) and in the detail panes.
+        selector_show_nu = false,
+        selector_show_rnu = false,
+        show_nu = true,
+        show_rnu = false,
+        -- Every key here takes **both cases**, without exception, so none of them is a
+        -- thing to remember: the panes these are bound on are read-only, so the letter
+        -- has no other job and there is nothing to be gained by claiming one case of it.
+        -- Each action that has an "…and all of them" variant pairs a letter with the
+        -- same letter under Ctrl (`r`/`<C-r>`, `s`/`<C-s>`). (The `<C-…>` keys need no
+        -- case pair: a terminal sends the same byte for `<C-r>` and `<C-R>`, so one
+        -- mapping already answers both.)
+        mappings = {
+            -- Pane focus switching is the plugin-wide `switch_window_keys` (above),
+            -- shared with the clean form — not a runner-only mapping.
+            run_again = { "r", "R" },
+            run_all_again = "<C-r>",
+            -- `s` for stop, which is also what this does in stress mode (stops the search).
+            -- `k`/`K` are unavailable: `j`/`k` walk the testcase rows. `<C-s>` reaches
+            -- Neovim, since raw mode clears the terminal's IXON, so the display does not
+            -- freeze the way it does in a shell.
+            stop = { "s", "S" },
+            stop_all = "<C-s>",
+            zoom_input = { "i", "I" },
+            zoom_expected = { "a", "A" },
+            zoom_stdout = { "o", "O" },
+            zoom_stderr = { "e", "E" },
+            toggle_diff = { "d", "D" },
+            -- `<Esc>`/`<C-c>` are what dismisses every other surface in the plugin
+            -- (`cancel_keys`), so they dismiss this
+            -- one too. Bound in normal mode only, as all the close keys are, so an
+            -- `<Esc>` typed while editing a testcase only leaves insert mode; a
+            -- second one closes the UI, and an unsaved edit is caught by the same
+            -- prompt that catches `q`.
+            close = { "<esc>", "<C-c>", "q", "Q" },
+            -- Inline testcase management, from the selector. Editing itself needs no
+            -- key: the Input and Expected Output panes are ordinary editable buffers
+            -- and `:w` saves the testcase and re-runs it.
+            add_testcase = { "n", "N" },
+            -- One the generator writes, a fresh seed each time. `t` because `g` begins `gg`
+            -- and `G` is the list's last row.
+            generate_testcase = { "t", "T" },
+            delete_testcase = { "x", "X" },
+            -- `c` for cases: `s` is stop, and every other letter this action could
+            -- want is either a cursor key (`j`/`k`) or already an action.
+            split_testcase = { "c", "C" },
+            -- Restores the testcase deleted last, whatever was done since, and the one
+            -- before it on the next press.
+            restore_testcase = { "u", "U" },
+            help = "?",
+        },
+        -- A pane zoomed by the `zoom_*` keys, a float over the grid: its size as a share of the
+        -- editor, and its line numbers.
+        zoom = {
+            -- Large on purpose: zooming exists to escape the cramped detail panes,
+            -- so one that leaves a quarter of the grid showing around it has the same
+            -- problem it was opened to solve. Clamped to the float band, as everything
+            -- else is, so a small editor still gets a frame that fits.
+            width = 0.8,
+            height = 0.8,
+            show_nu = true,
+            show_rnu = false,
+        },
+    },
+    -- The runner UI as floats (`runner_ui.interface = "popup"`): the grid's share of the
+    -- editor, and its layout.
+    popup_ui = {
+        width = 0.8,
+        height = 0.8,
+        -- A layout is a list of `{ ratio, pane-or-sub-layout }` pairs; nesting
+        -- alternates direction (the top level splits into columns). Panes:
+        -- `tc` testcases, `so` output, `eo` expected output, `si` input, `se` errors.
+        -- Any of them but `tc` may be left out — what is left simply divides the
+        -- space, and an omitted pane's content can still be zoomed.
+        -- Two pairings decide this arrangement: `so`/`eo` share a row because the
+        -- diff compares them line against line, and the two editable panes
+        -- (`eo`/`si`, the accented ones) share a column so what you can type into
+        -- is one block at the edge rather than two corners of a diagonal.
+        layout = {
+            { 3, "tc" },
+            { 4, { { 1, "so" }, { 1, "se" } } },
+            { 4, { { 1, "eo" }, { 1, "si" } } },
+        },
+    },
+    -- The runner UI as real windows (`runner_ui.interface = "split"`): where the frame
+    -- opens, and its share of the editor, `width` beside it (left, right) or `height`
+    -- below it (top, bottom). `relative_to_editor` takes that share of the whole editor,
+    -- false of the window it opens from.
+    split_ui = {
+        position = "right", -- "top" | "bottom" | "left" | "right"
+        relative_to_editor = true,
+        width = 0.3,
+        -- Same format and same freedom as `popup_ui.layout` above; the layout used
+        -- depends on whether `position` puts the frame beside or below the editor.
+        vertical_layout = {
+            { 1, "tc" },
+            { 1, { { 1, "so" }, { 1, "eo" } } },
+            { 1, { { 1, "se" }, { 1, "si" } } },
+        },
+        height = 0.4,
+        horizontal_layout = {
+            { 2, "tc" },
+            { 3, { { 1, "so" }, { 1, "se" } } },
+            { 3, { { 1, "eo" }, { 1, "si" } } },
+        },
+    },
+}
+
+---The configuration in force: the defaults, with the last `setup()`'s options laid over
+---them once one is called. A copy, for the reason `setup()` gives.
+---@type table
+M.current_setup = vim.deepcopy(M.defaults)
+
+---Whether `setup()` has been called, for `:checkhealth`: tuna runs on the defaults without it.
+M.configured = false
+
+---Per-buffer resolved configuration (current_setup + local config), cached.
+---@type table<integer, table>
+M.buffer_configs = {}
+
+---Return a configuration table built by extending `cfg_tbl` with `opts`.
+---@param cfg_tbl table? base configuration (defaults to `M.defaults`)
+---@param opts table? options to layer on top
+---@return table
+function M.update_config_table(cfg_tbl, opts)
+    if not opts then
+        return vim.deepcopy(cfg_tbl or M.defaults)
+    end
+
+    -- `vim.tbl_deep_extend` already replaces a non-empty *list* wholesale (its
+    -- `can_merge` refuses lists), so a user-supplied `args` or file-format list needs
+    -- no special-casing: only map-like tables merge key by key. The one shape it
+    -- treats differently is an empty list, which merges — and "override with an empty
+    -- list" has no meaning for any option here.
+    return vim.tbl_deep_extend("force", cfg_tbl or M.defaults, opts) --[[@as table]]
+end
+
+---Initialise configuration from user options.
+---@param opts table? user options
+function M.setup(opts)
+    -- Rebuilt from the **defaults**, not layered onto whatever the last call left
+    -- behind, so calling `setup()` again means "this is my config" rather than "add
+    -- this to my config": a merge can add a key but never remove one, so re-sourcing a
+    -- config with a nested key taken out would leave the old value in force.
+    --
+    -- The copy is not optional: `vim.tbl_deep_extend` copies a sub-table only where
+    -- both sides have one, so everything the user did not mention lands in
+    -- `current_setup` **by reference** — a later write through it would quietly
+    -- poison `M.defaults` for the rest of the session.
+    M.current_setup = M.update_config_table(vim.deepcopy(M.defaults), opts)
+    M.configured = true
+    M.buffer_configs = {} -- invalidate caches so buffers re-resolve against new setup
+end
+
+-- Each `.tuna.lua` as it was last run, by path, with a hash of the text that ran. It is run
+-- again only when that text changes: every run makes its functions new ones, and a buffer's
+-- config holding a function that is not the one its cached runner holds never equals it
+-- (`vim.deep_equal`), so `commands` would build a new runner, and a new board, on every run.
+---@type table<string, { hash: string, config: table }>
+local local_configs = {}
+
+---Find and load the nearest `.tuna.lua`, searching upward from `directory`.
+---@param directory string directory to start the upward search from
+---@return table? # the local configuration, or `nil` if absent or invalid
+function M.load_local_config(directory)
+    if not directory or directory == "" then
+        directory = vim.fn.getcwd()
+    end
+    -- `vim.fs.find` with `upward = true` walks up the parent chain.
+    local found = vim.fs.find(M.current_setup.local_config_file_name, {
+        path = directory,
+        upward = true,
+        type = "file",
+    })
+    if not found[1] then
+        return nil
+    end
+
+    local text = utils.read_file(found[1], true)
+    if not text then
+        return nil
+    end
+    local hash = vim.fn.sha256(text)
+    local known = local_configs[found[1]]
+    if known and known.hash == hash then
+        return known.config
+    end
+    local chunk, err = load(text, "@" .. found[1])
+    local ok, local_config = false, err
+    if chunk then
+        ok, local_config = pcall(chunk)
+    end
+    if not ok then
+        utils.notify("'" .. found[1] .. "' has an error, so it is ignored:\n" .. tostring(local_config))
+        return nil
+    end
+    if type(local_config) ~= "table" then
+        utils.notify("'" .. found[1] .. "' did not return a table, so it is ignored.")
+        return nil
+    end
+    local_configs[found[1]] = { hash = hash, config = local_config }
+    return local_config
+end
+
+---Load the local configuration for a directory and extend `current_setup` with it.
+---@param directory string
+---@return table
+function M.load_local_config_and_extend(directory)
+    return M.update_config_table(M.current_setup, M.load_local_config(directory))
+end
+
+---Resolve and cache the configuration for a buffer.
+---@param bufnr integer
+function M.load_buffer_config(bufnr)
+    local directory = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":p:h")
+    M.buffer_configs[bufnr] = M.load_local_config_and_extend(directory)
+end
+
+---Get the configuration for a buffer, resolving it on first access.
+---@param bufnr integer
+---@return table
+function M.get_buffer_config(bufnr)
+    if not M.buffer_configs[bufnr] then
+        M.load_buffer_config(bufnr)
+    end
+    return M.buffer_configs[bufnr]
+end
+
+return M

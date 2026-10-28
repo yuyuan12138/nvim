@@ -1,0 +1,467 @@
+-- lua/tuna/utils.lua
+--
+-- Foundation module: notifications, string-modifier evaluation, filesystem and path
+-- helpers, and float geometry. Everything else in tuna depends on this, so it depends on
+-- no other tuna module. Files are read and written through `vim.uv`, whose `fs_*`
+-- functions run synchronously when given no callback.
+
+local M = {}
+
+---Show a tuna notification.
+---@param msg string message to display
+---@param level? string|integer a `vim.log.levels` value, or its name ("INFO", "WARN", "ERROR", ...); defaults to ERROR
+function M.notify(msg, level)
+    if type(level) == "string" then
+        level = vim.log.levels[level]
+    end
+    vim.notify("Tuna: " .. msg, level or vim.log.levels.ERROR, { title = "Tuna" })
+end
+
+---Remap a floating window's border highlight so the border keeps the configured
+---`hl` foreground (the coloured line) but takes the *float's own* background —
+---i.e. `NormalFloat`'s bg. This makes the border ring share the interior fill:
+---there's no seam between border and content, so the float reads as one solid
+---panel whose corners the rounded glyphs sit on. (A terminal cell can't be split,
+---so the fill can't literally be rounded; matching the fill is the closest look.)
+---The derived group is (re)computed each call so it tracks colourscheme changes.
+---@param winid integer
+---@param hl string? highlight group whose foreground is used for the border
+function M.set_border_highlight(winid, hl, group)
+    hl = hl or "FloatBorder"
+    -- One derived group per source highlight, so a window using an accent (the runner
+    -- UI's editable panes) doesn't overwrite the one every other float is using.
+    group = group or "TunaFloatBorder"
+    local border = vim.api.nvim_get_hl(0, { name = hl, link = false })
+    local float = vim.api.nvim_get_hl(0, { name = "NormalFloat", link = false })
+    local normal = vim.api.nvim_get_hl(0, { name = "Normal", link = false })
+    vim.api.nvim_set_hl(0, group, {
+        fg = border.fg,
+        bg = float.bg or normal.bg,
+        sp = border.sp,
+        bold = border.bold,
+        italic = border.italic,
+    })
+    -- The footer (how much of the pane is out of sight) wears the border's colour too.
+    vim.wo[winid].winhighlight = "FloatBorder:" .. group .. ",FloatFooter:" .. group
+end
+
+---------------- STRING MODIFIERS ----------------
+--
+-- A "modifier" is a `$(NAME)` placeholder inside a string that gets replaced
+-- with a computed value. They appear in compile/run commands and in testcase
+-- file-name formats. `$()` (empty name) is an escape that inserts a literal `$`.
+
+---A modifier replacement: either a literal string, or a function that receives
+---the evaluation argument (e.g. a filepath) and returns the replacement string.
+---@alias tuna.Modifier string | fun(arg: any?): string
+---@alias tuna.Modifiers table<string, tuna.Modifier>
+
+---Replace `$(NAME)` modifiers in `str` using the given `modifiers` table.
+---
+---Implemented as a small state machine scanning the string once:
+---  * `mod_start ==  0` → idle, copying characters through
+---  * `mod_start == -1` → just saw a `$`, expecting `(`
+---  * `mod_start >   0` → inside `$(...)`, position of the opening `(`
+---
+---Returns `nil` (after notifying) on a malformed string or an unknown modifier,
+---so callers can treat formatting failure as recoverable.
+---@param str string string to evaluate
+---@param modifiers tuna.Modifiers
+---@param argument any? argument passed to function modifiers
+---@return string? # evaluated string, or `nil` on failure
+function M.format_modifiers(str, modifiers, argument)
+    local out = {}
+    local mod_start = 0
+
+    for i = 1, #str do
+        local c = str:sub(i, i)
+        if mod_start == -1 then -- a `$` was just seen, an opening `(` must follow
+            if c == "(" then
+                mod_start = i
+            else
+                M.notify("a '$' not followed by '(' in:\n" .. str)
+                return nil
+            end
+        elseif mod_start == 0 then
+            if c == "$" then
+                mod_start = -1
+            else
+                table.insert(out, c)
+            end
+        elseif c == ")" then -- close the current modifier
+            local name = str:sub(mod_start + 1, i - 1)
+            local replacement = modifiers[name]
+            if type(replacement) == "string" then
+                table.insert(out, replacement)
+            elseif type(replacement) == "function" then
+                table.insert(out, replacement(argument))
+            else
+                M.notify("unknown modifier $(" .. name .. ") in:\n" .. str)
+                return nil
+            end
+            mod_start = 0
+        end
+        -- when inside a modifier and c ~= ")", the character is part of the name
+    end
+
+    -- A `$` or `$(` the string ended inside: the tail was never a modifier, and
+    -- returning what was collected so far would silently drop it.
+    if mod_start ~= 0 then
+        M.notify("a modifier with no closing ')' in:\n" .. str)
+        return nil
+    end
+
+    return table.concat(out)
+end
+
+---Fill the modifiers `modifiers` knows in a file's text, leaving every other `$` as it is
+---written: text is not a configured string, and a `$(…)` in it may be a shell's command
+---substitution or a dollar sign in a comment.
+---@param str string
+---@param modifiers tuna.Modifiers
+---@param argument any? argument passed to function modifiers
+---@return string
+function M.fill_modifiers(str, modifiers, argument)
+    return (str:gsub("%$%(([^()]*)%)", function(name)
+        local replacement = modifiers[name]
+        if type(replacement) == "function" then
+            return replacement(argument)
+        end
+        return replacement
+    end))
+end
+
+---File-format modifiers, evaluated against a file path. `$(TCNUM)` (testcase
+---number) is supplied per-call by `eval_string`, not stored here.
+---@type tuna.Modifiers
+M.file_format_modifiers = {
+    [""] = "$", -- $() inserts a literal dollar sign
+    HOME = function()
+        return vim.uv.os_homedir() or ""
+    end,
+    CWD = function()
+        return vim.fn.getcwd()
+    end,
+    FNAME = function(filepath)
+        return vim.fn.fnamemodify(filepath, ":t")
+    end,
+    FNOEXT = function(filepath)
+        return vim.fn.fnamemodify(filepath, ":t:r")
+    end,
+    FEXT = function(filepath)
+        return vim.fn.fnamemodify(filepath, ":e")
+    end,
+    FABSPATH = function(filepath)
+        return filepath
+    end,
+    ABSDIR = function(filepath)
+        return vim.fn.fnamemodify(filepath, ":p:h")
+    end,
+    -- The name of the directory the file lives in, not its path: for a downloaded
+    -- problem that is the problem itself ("D. Permutation Cuts"), which is what makes
+    -- a shared testcase root (`~/cp/testcases/$(DIRNAME)`) collision-free even when
+    -- every problem's source is called `main.cpp`.
+    DIRNAME = function(filepath)
+        return vim.fn.fnamemodify(filepath, ":p:h:t")
+    end,
+}
+
+---Evaluate a string containing file-format modifiers against a file path.
+---@param filepath string absolute path the modifiers are computed from
+---@param str string string to evaluate
+---@param tcnum? integer|string testcase number for `$(TCNUM)`
+---@return string? # evaluated string, or `nil` on failure
+function M.eval_string(filepath, str, tcnum)
+    -- Merge a fresh per-call TCNUM in rather than mutating the shared table, so
+    -- evaluation has no hidden state between calls.
+    local modifiers = vim.tbl_extend("force", M.file_format_modifiers, {
+        TCNUM = tostring(tcnum or ""),
+    })
+    return M.format_modifiers(str, modifiers, filepath)
+end
+
+---Like `eval_string`, but resolves the file path from a buffer.
+---@param bufnr integer buffer number
+---@param str string string to evaluate
+---@param tcnum? integer|string testcase number for `$(TCNUM)`
+---@return string? # evaluated string, or `nil` on failure
+function M.buf_eval_string(bufnr, str, tcnum)
+    return M.eval_string(vim.api.nvim_buf_get_name(bufnr), str, tcnum)
+end
+
+---A command with the file modifiers in its exec and every arg expanded against `filepath`, or
+---nil when one of them cannot be.
+---@param filepath string
+---@param command { exec: string, args: string[]? }
+---@return { exec: string, args: string[] }?
+function M.eval_command(filepath, command)
+    local exec = M.eval_string(filepath, command.exec)
+    if not exec then
+        return nil
+    end
+    local args = {}
+    for i, arg in ipairs(command.args or {}) do
+        args[i] = M.eval_string(filepath, arg)
+        if not args[i] then
+            return nil
+        end
+    end
+    return { exec = exec, args = args }
+end
+
+---------------- FILESYSTEM ----------------
+
+---A fresh temporary file holding `content`, for a program that reads its input from a path.
+---@param content string?
+---@return string path
+function M.temp_file(content)
+    local path = vim.fn.tempname()
+    M.write_file(path, content or "")
+    return path
+end
+
+---@param path string
+---@return boolean
+function M.file_exists(path)
+    local stat = vim.uv.fs_stat(path)
+    return stat ~= nil and stat.type == "file"
+end
+
+---@param path string
+---@return boolean
+function M.directory_exists(path)
+    local stat = vim.uv.fs_stat(path)
+    return stat ~= nil and stat.type == "directory"
+end
+
+---The names of the directories in `dir`, in name order, dot-directories left out: a contest's
+---problems, or a judge's contests.
+---@param dir string
+---@return string[]
+function M.subdirectories(dir)
+    local names = {}
+    if M.directory_exists(dir) then
+        for name, typ in vim.fs.dir(dir) do
+            if typ == "directory" and name:sub(1, 1) ~= "." then
+                names[#names + 1] = name
+            end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+---Create `path` (and any missing parents) if it doesn't already exist.
+---@param path string
+---@return boolean # whether the directory exists after the call
+function M.ensure_directory(path)
+    if not path or path == "" then
+        return false
+    end
+    if M.directory_exists(path) then
+        return true
+    end
+    -- `mkdir(path, "p")` is the idiomatic "mkdir -p": create parents as needed.
+    vim.fn.mkdir(path, "p")
+    return M.directory_exists(path)
+end
+
+---Read a whole file as a string. By default CRLF is normalized to LF; pass
+---`raw = true` for binary content (e.g. msgpack) that must not be transformed.
+---@param path string
+---@param raw? boolean read bytes verbatim, without CRLF normalization
+---@return string? # file contents, or `nil` if the file can't be read
+function M.read_file(path, raw)
+    local fd = vim.uv.fs_open(path, "r", 438) -- 438 == 0o666
+    if not fd then
+        return nil
+    end
+    local stat = vim.uv.fs_fstat(fd)
+    local content = stat and vim.uv.fs_read(fd, stat.size, 0) or nil
+    vim.uv.fs_close(fd)
+    if content and not raw then
+        content = content:gsub("\r\n", "\n")
+    end
+    return content
+end
+
+---Write `content` to `path`, creating parent directories as needed.
+---@param path string
+---@param content string
+---@return boolean ok, string? err
+function M.write_file(path, content)
+    M.ensure_directory(vim.fn.fnamemodify(path, ":h"))
+    local fd, open_err = vim.uv.fs_open(path, "w", 420) -- 420 == 0o644
+    if not fd then
+        return false, open_err
+    end
+    vim.uv.fs_write(fd, content, 0)
+    vim.uv.fs_close(fd)
+    return true
+end
+
+---Delete a file.
+---@param path string
+---@return boolean # whether the file was removed
+function M.delete_file(path)
+    return vim.uv.fs_unlink(path) ~= nil
+end
+
+-- Hashes already taken this session, by path, with the file's identity when they were taken.
+-- The menu asks for every remembered problem's hash each time it opens, and a source whose
+-- size, modification time and inode are unchanged has the same contents: the hash is what a
+-- verdict is kept against, and the stat only spares reading and hashing the file again.
+local hashes = {}
+
+---The SHA-256 of a file's contents, or nil when it can't be read. What a saved verdict is
+---recorded against, so it describes exactly the source it was about.
+---@param path string
+---@return string?
+function M.file_hash(path)
+    local st = vim.uv.fs_stat(path)
+    if not st then
+        return nil
+    end
+    local stamp = table.concat({ st.size, st.mtime.sec, st.mtime.nsec, st.ino }, ":")
+    local known = hashes[path]
+    if known and known.stamp == stamp then
+        return known.hash
+    end
+    local content = M.read_file(path, true)
+    local hash = content and vim.fn.sha256(content) or nil
+    hashes[path] = hash and { stamp = stamp, hash = hash } or nil
+    return hash
+end
+
+---Whether `path` is absolute. Checked after `vim.fs.normalize`, so a Windows path
+---has already been folded to forward slashes and a leading `~` expanded.
+---@param path string
+---@return boolean
+function M.is_absolute(path)
+    return path:sub(1, 1) == "/" or path:match("^%a:/") ~= nil or path:sub(1, 2) == "//"
+end
+
+---Expand a leading `~` to the user's home directory. The one thing a configured path
+---needs that the modifier engine does not do: `$(HOME)` is a modifier tuna expands,
+---while `~` is shell syntax that never reaches a shell — so left alone it survives into
+---the path and becomes a directory literally *named* `~`, beside whatever the path was
+---resolved against. Only the leading one, since `~` is an ordinary character anywhere
+---else in a filename. Only a bare `~` or a `~/` prefix: `~backup/file` names a
+---directory (or another user's home), not this user's, so it is left alone. Plain
+---concatenation rather than `gsub`, whose replacement string would misread a `%` in
+---the home path as a capture reference.
+---@generic T: string?
+---@param path T
+---@return T
+function M.expand_home(path)
+    if type(path) ~= "string" or (path ~= "~" and path:sub(1, 2) ~= "~/") then
+        return path
+    end
+    local home = vim.uv.os_homedir() or vim.env.HOME
+    if not home then
+        return path
+    end
+    return home .. path:sub(2)
+end
+
+---Resolve `path` to an absolute path. Relative paths are taken against
+---`base_dir` (defaulting to the cwd). Absolute paths are returned unchanged.
+---@param path string
+---@param base_dir? string
+---@return string
+function M.normalize_path(path, base_dir)
+    if type(path) ~= "string" or path == "" then
+        return base_dir or "."
+    end
+    path = vim.fs.normalize(path)
+    if M.is_absolute(path) then
+        return path
+    end
+    return vim.fs.normalize(vim.fn.fnamemodify((base_dir or ".") .. "/" .. path, ":p"))
+end
+
+---------------- UI ----------------
+
+---Put the cursor where `config.template_cursor` says a freshly-opened solution should
+---start being typed. Templates open on their header, which is never that place. The
+---spec is a number (that line), a Lua pattern (the first line matching it), a
+---`{ pattern = …, offset = n }` table (that many lines below the match — a landmark
+---like `void solve()` is what one recognizes, but the line *under* it is where the
+---typing goes), or a function computing the line. A pattern that matches nothing
+---leaves the cursor alone, so a spec written for one language does no harm in another;
+---anything out of range is clamped. Placed at once, so the file is drawn with the cursor
+---already there, and once only: a plugin the user installed to place it (restoring the last
+---position) is theirs to have the last word.
+---@param cfg table resolved configuration
+---@param bufnr integer? defaults to the current buffer
+function M.place_cursor(cfg, bufnr)
+    local spec = cfg.template_cursor
+    if not spec then
+        return
+    end
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+        return
+    end
+    local pattern, offset
+    if type(spec) == "string" then
+        pattern, offset = spec, 0
+    elseif type(spec) == "table" then
+        pattern, offset = spec.pattern, spec.offset or 0
+    end
+
+    local line
+    if type(spec) == "number" then
+        line = spec
+    elseif type(spec) == "function" then
+        local ok, res = pcall(spec, bufnr)
+        line = ok and tonumber(res) or nil
+    elseif pattern then
+        for i, l in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)) do
+            if l:match(pattern) then
+                line = i + offset
+                break
+            end
+        end
+    end
+    if not line then
+        return
+    end
+    line = math.max(1, math.min(line, vim.api.nvim_buf_line_count(bufnr)))
+    -- Only in a window actually showing the buffer: an opened-but-unfocused file
+    -- (a contest writes several) has no cursor to move.
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_get_buf(win) == bufnr then
+            pcall(vim.api.nvim_win_set_cursor, win, { line, 0 })
+        end
+    end
+end
+
+-- Rows left clear above and below every floating UI. A frame flush against the top of
+-- the window or against the statusline reads as a rendering glitch, and one row of
+-- breathing room is what makes a dialog look placed rather than crammed.
+M.FLOAT_MARGIN = 1
+
+---The band of editor rows a floating UI may occupy: the first row it may use, and how
+---many rows it has. Every float in the plugin sizes and centres itself inside this, so
+---the margin is decided in one place.
+---@return integer row0 first usable row (0-based)
+---@return integer height rows available between the margins
+function M.float_band()
+    local _, height = M.get_ui_size()
+    local margin = M.FLOAT_MARGIN
+    return margin, math.max(1, height - 2 * margin)
+end
+
+---Usable editor size: columns, and rows excluding the command line and (when
+---shown) the global statusline.
+---@return integer width, integer height
+function M.get_ui_size()
+    local height = vim.o.lines - vim.o.cmdheight
+    if vim.o.laststatus ~= 0 then
+        height = height - 1
+    end
+    return vim.o.columns, height
+end
+
+return M

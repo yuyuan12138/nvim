@@ -1,0 +1,672 @@
+-- lua/tuna/run/modes/multi.lua
+--
+-- Run *every* solution version in a problem directory against the shared testcases
+-- (`:Tuna run all`). This is for when you keep several attempts side by side —
+-- `main.cpp`, `slow.cpp`, `wrong.cpp` — and want to see at a glance which pass.
+--
+-- The candidate files are the runnable sibling *source* files, of any language
+-- (each file's compile/run commands come from its own filetype), minus helper files
+-- (`checker.*`/`gen.*`/`brute.*`/`interactor.*`). Commands are resolved per file with
+-- `utils.eval_string` (no buffer needed), and each verdict goes through the same
+-- `checker` as a normal run.
+--
+-- A `MultiRunner` (a `RunnerCore` subclass) drives the shared runner UI as a
+-- flattened matrix: one solution *header* row (name + a live `correct/total`) above
+-- its indented per-testcase rows. Selecting a testcase row shows that exact run in
+-- the detail panes; selecting a solution row shows its per-testcase summary and any
+-- compile output.
+
+local config = require("tuna.config")
+local utils = require("tuna.utils")
+local checker = require("tuna.run.checker")
+local testcases = require("tuna.problem.testcases")
+local tools = require("tuna.run.tools")
+local core = require("tuna.run.core")
+
+local M = {}
+
+-- Live run-all runners keyed by buffer, so `VimResized` can rebuild their UIs and
+-- `show_ui` can re-open them (mirrors stress/interactive `M.active`).
+---@type table<integer, table>
+M.active = {}
+
+--------------------------------------------------------------------------------
+-- MultiRunner (a RunnerCore subclass the runner UI drives)
+--------------------------------------------------------------------------------
+
+local MultiRunner = core.extend()
+
+---One extra "Run" pane row: how many solution versions are being tested.
+---@return string[][]
+function MultiRunner:status_tail()
+    return { { "solutions", tostring(#self.files) } }
+end
+
+---The selector's left column: solution names at column 0, their testcases indented.
+---@param tc table
+---@param unsaved boolean? the row has an edit not yet written
+---@return string
+function MultiRunner:row_label(tc, unsaved)
+    if tc.kind == "solution" then
+        return tc.name
+    end
+    -- Named as the normal board names it, until it has an edit or a file behind it.
+    if tc.bare and not unsaved then
+        return "  No input"
+    end
+    return "  TC " .. tostring(tc.tcnum)
+end
+
+---A per-testcase summary shown when a solution header row is selected.
+---@param hrow table
+---@return string
+function MultiRunner:solution_summary(hrow)
+    local sol = hrow.sol
+    if not sol then
+        return ""
+    end
+    local lines = {}
+    for _, ci in ipairs(sol.case_idxs) do
+        local c = self.tcdata[ci]
+        local t = (c.time and c.time >= 0) and string.format(" (%.3f s)", c.time / 1000) or ""
+        lines[#lines + 1] = string.format("TC %s: %s%s", tostring(c.tcnum), c.status ~= "" and c.status or "pending", t)
+    end
+    return table.concat(lines, "\n")
+end
+
+---Detail-pane content: solution rows show a per-testcase summary (Output) and any
+---compile output (Errors); testcase rows are the base class's — including the Errors
+---pane carrying a checker's message.
+function MultiRunner:pane_content(tc, name)
+    if tc.kind == "solution" then
+        if name == "so" then
+            return self:solution_summary(tc)
+        elseif name == "se" then
+            return tc.compile_output or ""
+        end
+        return ""
+    end
+    return core.RunnerCore.pane_content(self, tc, name)
+end
+
+---A solution's header row.
+---@param sol table
+---@return table
+local function header_row(sol)
+    return { kind = "solution", name = sol.name, sol = sol, status = "", hlgroup = "TunaRunning", time_label = "" }
+end
+
+---The testcases the matrix shows, read off its rows, the one record of them: every solution
+---shows the same ones.
+---@return integer[] ascending
+function MultiRunner:testcase_numbers()
+    local seen, nums = {}, {}
+    for _, tc in ipairs(self.tcdata) do
+        if tc.kind == "case" and not seen[tc.tcnum] then
+            seen[tc.tcnum] = true
+            nums[#nums + 1] = tc.tcnum
+        end
+    end
+    table.sort(nums)
+    return nums
+end
+
+---Lay the matrix out for testcases `nums`: for each solution, its header row, then one row
+---per testcase. A row already on the board is kept, result and all; a new one takes its text
+---from `tctbl` when given (the first load), else starts empty for a save or a sync to fill.
+---One the first load has no testcase for is `bare`, the normal board's row of a run with
+---nothing to test.
+---@param nums integer[] ascending
+---@param tctbl table<integer, tuna.StoredTestcase>?
+---@param status string what a new row reads
+---@param hlgroup string
+function MultiRunner:lay_out(nums, tctbl, status, hlgroup)
+    local headers, cases = {}, {}
+    for _, tc in ipairs(self.tcdata) do
+        if tc.kind == "solution" then
+            headers[tc.name] = tc
+        else
+            cases[tc.sol.name .. "\0" .. tc.tcnum] = tc
+        end
+    end
+    self.tcdata = {}
+    for _, sol in ipairs(self.files) do
+        local header = headers[sol.name]
+        table.insert(self.tcdata, header or header_row(sol))
+        sol.header_idx = #self.tcdata
+        sol.case_idxs = {}
+        for _, n in ipairs(nums) do
+            local stored = tctbl and tctbl[n] or {}
+            local row = cases[sol.name .. "\0" .. n]
+                or {
+                    kind = "case",
+                    tcnum = n,
+                    sol = sol,
+                    bare = tctbl ~= nil and tctbl[n] == nil or nil,
+                    stdin = stored.input or "",
+                    expected = stored.output,
+                    status = status,
+                    hlgroup = hlgroup,
+                }
+            table.insert(self.tcdata, row)
+            table.insert(sol.case_idxs, #self.tcdata)
+        end
+        if header then
+            self:recompute_header(sol)
+        end
+    end
+end
+
+---Testcases are shared by every solution here, so one row per solution shows each
+---of them; the identity the UI reopens on has to name both.
+---@param tc table
+---@return string
+function MultiRunner:row_id(tc)
+    if tc.kind == "solution" then
+        return tc.name
+    end
+    return (tc.sol and tc.sol.name or "?") .. "#" .. tostring(tc.tcnum)
+end
+
+---`run all` may be launched from a buffer that isn't a solution at all (a scratch
+---buffer in the problem folder), so testcase paths are resolved against the
+---solution it anchored on instead.
+---@return integer
+function MultiRunner:edit_bufnr()
+    if not self.edit_anchor then
+        return self.bufnr
+    end
+    return vim.fn.bufadd(self.edit_anchor)
+end
+
+---A testcase added from the runner UI belongs to every solution in the matrix.
+---@param tcnum integer
+function MultiRunner:add_testcase_row(tcnum)
+    local nums = self:testcase_numbers()
+    nums[#nums + 1] = tcnum
+    table.sort(nums)
+    self:lay_out(nums, nil, "NOT RUN", "TunaDone")
+end
+
+---…and deleting one removes it from every solution.
+---@param tcnum integer
+function MultiRunner:remove_testcase_rows(tcnum)
+    self:lay_out(vim.tbl_filter(function(n)
+        return n ~= tcnum
+    end, self:testcase_numbers()), nil, "NOT RUN", "TunaDone")
+end
+
+---The row of `tcnum` under the solution of `beside`, so adding or restoring a testcase
+---leaves the user in the section they were working in.
+---@param tcnum integer
+---@param beside table?
+---@return integer?
+function MultiRunner:row_for(tcnum, beside)
+    local rows = self:rows_for(tcnum)
+    for _, i in ipairs(rows) do
+        if beside and self.tcdata[i].sol == beside.sol then
+            return i
+        end
+    end
+    return rows[1]
+end
+
+---Recompute a solution header row's `correct/total` from its testcase rows.
+---@param sol table
+function MultiRunner:recompute_header(sol)
+    local hrow = self.tcdata[sol.header_idx]
+    -- Over the judged rows only, the rule a local verdict counts by: a testcase with no answer,
+    -- one stopped or never run, says nothing about whether the solution is right.
+    local correct, total, pending = 0, 0, false
+    for _, ci in ipairs(sol.case_idxs) do
+        local c = self.tcdata[ci]
+        if core.judged(c.status) then
+            total = total + 1
+            if c.status == "CORRECT" then
+                correct = correct + 1
+            end
+        elseif c.status == "" or c.status == "RUNNING" or c.judging then
+            pending = true
+        end
+    end
+    hrow.correct, hrow.total = correct, total
+    hrow.status = correct .. "/" .. total
+    if correct < total then
+        hrow.hlgroup = "TunaWrong"
+    elseif pending then
+        hrow.hlgroup = "TunaRunning"
+    else
+        hrow.hlgroup = total > 0 and "TunaCorrect" or "TunaDone"
+    end
+end
+
+---@param sol table
+---@param status string
+---@param hl string
+function MultiRunner:set_cases(sol, status, hl)
+    for _, ci in ipairs(sol.case_idxs) do
+        local c = self.tcdata[ci]
+        c.status, c.hlgroup = status, hl
+    end
+end
+
+---Compile one solution (no-op for interpreted languages), reporting via `cb(ok)`.
+---A failure becomes a `CE` header row (cases marked `—`) shown in the UI. A build this
+---session already made from the same source, headers and command is reused, as in every
+---mode (`tools.reuse_build`).
+---@param sol table
+---@param cb fun(ok: boolean)
+function MultiRunner:compile_solution(sol, cb)
+    if not sol.cc then
+        return cb(true)
+    end
+    local hrow = self.tcdata[sol.header_idx]
+    local reused, remember = tools.reuse_build(sol.path, sol.cc, self.compdir, sol.rc and sol.rc.exec, self.rundir)
+    if reused then
+        hrow.compile_output = reused.stdout .. reused.stderr
+        return cb(true)
+    end
+    hrow.status, hrow.hlgroup = "compiling", "TunaRunning"
+    self:update_ui(true)
+    utils.ensure_directory(self.compdir)
+    -- pcall'd: a compiler that is not installed makes `vim.system` itself throw, and
+    -- that is this solution's CE, not an editor error.
+    local ok, err = pcall(
+        vim.system,
+        vim.list_extend({ sol.cc.exec }, vim.deepcopy(sol.cc.args)),
+        { cwd = self.compdir },
+        function(res)
+            vim.schedule(function()
+                hrow.compile_output = (res.stdout or "") .. (res.stderr or "")
+                if res.code ~= 0 then
+                    hrow.status, hrow.hlgroup = "CE", "TunaWarning"
+                    self:set_cases(sol, "—", "TunaDone")
+                    self:update_ui(true)
+                    return cb(false)
+                end
+                remember(res.stdout, res.stderr)
+                cb(true)
+            end)
+        end
+    )
+    if not ok then
+        hrow.compile_output = tostring(err)
+        hrow.status, hrow.hlgroup = "CE", "TunaWarning"
+        self:set_cases(sol, "—", "TunaDone")
+        self:update_ui(true)
+        cb(false)
+    end
+end
+
+---Run every solution version: compile them all first (in parallel), then run every
+---testcase across all compiled solutions through a shared pool of `multiple_testing`
+---concurrent processes. Header `correct/total`s update live as cases land.
+function MultiRunner:run_all()
+    self:refresh_judge(self.solution)
+    self.completed = false
+    self.stopped = false
+
+    -- Phase 1: compile every solution concurrently. A guard (`pending` starts at 1,
+    -- released after the loop) keeps the case phase from starting until every
+    -- compile has been *issued* and the synchronous (interpreted) ones have returned.
+    local pending = 1
+    local function compiled()
+        pending = pending - 1
+        if pending == 0 then
+            self:run_cases_parallel()
+        end
+    end
+    for _, sol in ipairs(self.files) do
+        sol.skip = false
+        local hrow = self.tcdata[sol.header_idx]
+        if not sol.rc then
+            hrow.status, hrow.hlgroup = "no run cmd", "TunaWarning"
+            self:set_cases(sol, "—", "TunaDone")
+            sol.skip = true
+        else
+            pending = pending + 1
+            self:compile_solution(sol, function(ok)
+                if ok then
+                    self:recompute_header(sol)
+                else
+                    sol.skip = true
+                end
+                compiled()
+            end)
+        end
+    end
+    self:update_ui(true)
+    compiled() -- release the guard
+end
+
+---@private
+---Run every case of every non-skipped solution through a shared lane pool.
+function MultiRunner:run_cases_parallel()
+    self.queue = {}
+    for _, sol in ipairs(self.files) do
+        if not sol.skip then
+            for _, ci in ipairs(sol.case_idxs) do
+                self.queue[#self.queue + 1] = ci
+            end
+        end
+    end
+    self.qpos = self.stopped and #self.queue or 0 -- stopped while it compiled: nothing starts
+    self.running_cases = 0
+    for _ = 1, core.parallelism(self.config, #self.queue) do
+        self:next_case_lane()
+    end
+    self:settle()
+end
+
+---@private
+---Start the next queued case in a lane; on finish it recomputes its solution's
+---header, pulls the next case, and checks for overall completion.
+function MultiRunner:next_case_lane()
+    if self.stopped or self.qpos >= #self.queue then
+        return
+    end
+    self.qpos = self.qpos + 1
+    if self.qpos > #self.queue then
+        return
+    end
+    local idx = self.queue[self.qpos]
+    local tc = self.tcdata[idx]
+    self:reset_row(tc)
+    self.running_cases = self.running_cases + 1
+    self:execute_process(idx, tc.sol.rc, self.rundir, { timelimit = self.timeout }, function()
+        self.running_cases = self.running_cases - 1
+        self:recompute_header(tc.sol)
+        self:update_ui(true)
+        self:next_case_lane()
+        self:settle()
+    end)
+end
+
+---Stop the matrix: what runs is killed, nothing queued starts, and the run settles once the
+---killed cases are in.
+function MultiRunner:kill_all_processes()
+    core.RunnerCore.kill_all_processes(self)
+    self.qpos = #(self.queue or {})
+    for _, sol in ipairs(self.files) do
+        if not sol.skip and sol.header_idx then
+            self:recompute_header(sol)
+        end
+    end
+    self:settle()
+end
+
+---@private
+---Recompile a single solution, then run its cases sequentially (used by the UI's
+---"run again" on a solution header row).
+---@param sol table
+function MultiRunner:rerun_solution(sol)
+    sol.skip = false
+    -- A re-run is a run: `idle()` must say so while it is in flight, so the
+    -- structural edits that wait on it do (see `settle`).
+    self.completed = false
+    self.stopped = false
+    self:compile_solution(sol, function(ok)
+        if not ok then
+            self:settle()
+            return
+        end
+        local ci = 0
+        local function step()
+            ci = ci + 1
+            if ci > #sol.case_idxs or self.stopped then
+                self:recompute_header(sol)
+                self:settle()
+                self:update_ui(true)
+                return
+            end
+            local idx = sol.case_idxs[ci]
+            self:reset_row(self.tcdata[idx])
+            self:execute_process(idx, sol.rc, self.rundir, { timelimit = self.timeout }, function()
+                self:recompute_header(sol)
+                self:update_ui(true)
+                step()
+            end)
+        end
+        step()
+    end)
+end
+
+---@private
+---Mark the run finished once nothing is running or queued: the shared pool, a single
+---row's re-run and a solution's all end here, and a stop drains the queue first.
+function MultiRunner:settle()
+    if self.completed or (self.running_cases or 0) > 0 or (self.qpos or 0) < #(self.queue or {}) then
+        return
+    end
+    self.completed = true
+    self:save_local_verdicts()
+    self:update_ui(true)
+end
+
+---Save each solution's local verdict over its own testcase rows (`core.save_local_verdict`).
+function MultiRunner:save_local_verdicts()
+    for _, sol in ipairs(self.files or {}) do
+        local rows = {}
+        for _, ci in ipairs(sol.case_idxs or {}) do
+            rows[#rows + 1] = self.tcdata[ci]
+        end
+        core.save_local_verdict(sol.path, rows)
+    end
+end
+
+---Re-run one row: a testcase row re-runs just that case (reusing the existing
+---binary); a solution header row recompiles and re-runs that whole solution.
+---@param idx integer
+function MultiRunner:run_single(idx)
+    local tc = self.tcdata[idx]
+    if not tc then
+        return
+    end
+    -- Nothing is built yet: the first run key builds and runs the whole matrix.
+    if self:built_first(function()
+        self:run_testcases()
+    end) then
+        return
+    end
+    self:refresh_judge(self.solution)
+    if tc.kind == "solution" then
+        self:rerun_solution(tc.sol)
+        return
+    end
+    self.completed = false
+    self.stopped = false
+    self:reset_row(tc)
+    self:execute_process(idx, tc.sol.rc, self.rundir, { timelimit = self.timeout }, function()
+        self:recompute_header(tc.sol)
+        self:settle()
+        self:update_ui(true)
+    end)
+end
+
+---Re-run the whole matrix (the UI's "run all again").
+function MultiRunner:run_testcases()
+    if self:built_first(function()
+        self:run_testcases()
+    end) then
+        return
+    end
+    for _, tc in ipairs(self.tcdata) do
+        if tc.kind == "case" then
+            self:reset_row(tc)
+        end
+    end
+    self:update_ui(true)
+    self:run_all()
+end
+
+--------------------------------------------------------------------------------
+-- Entry point
+--------------------------------------------------------------------------------
+
+---Run every sibling solution version against the testcases, in a matrix UI.
+---@param bufnr integer? defaults to the current buffer
+---@param opts { show_only: boolean?, list: string[]? }? `show_only` opens the UI with the rows
+---listed and nothing run; `list` runs only those testcases, as in normal mode
+function M.run(bufnr, opts)
+    opts = opts or {}
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    config.load_buffer_config(bufnr)
+    local cfg = config.get_buffer_config(bufnr)
+
+    -- Resolve the problem directory. When the buffer is a real file, that's its
+    -- parent. When it isn't (an unnamed/scratch buffer, common when you just `nvim`
+    -- into a folder), fall back to the working directory and run whatever solutions
+    -- live there — there's no "current" solution to anchor on. (`fnamemodify("", ":p")`
+    -- returns the cwd without a trailing slash, so a naive `:h` would wrongly climb to
+    -- the parent — hence the explicit check.)
+    local bufname = vim.api.nvim_buf_get_name(bufnr)
+    local curpath, dir
+    if bufname ~= "" and vim.fn.filereadable(bufname) == 1 then
+        curpath = vim.fs.normalize(vim.fn.fnamemodify(bufname, ":p"))
+        dir = vim.fn.fnamemodify(curpath, ":h")
+    else
+        dir = vim.fs.normalize(vim.fn.getcwd())
+    end
+
+    -- A candidate's filetype: the current buffer's own is authoritative for it
+    -- (respects a manual `:set ft`), others are matched from the filename.
+    local function candidate_filetype(f)
+        if curpath and vim.fs.normalize(vim.fn.fnamemodify(f, ":p")) == curpath then
+            local ft = vim.bo[bufnr].filetype
+            if ft and ft ~= "" then
+                return ft
+            end
+        end
+        return vim.filetype.match({ filename = f }) or ""
+    end
+
+    -- Discover every runnable sibling *source* file, of any language — so run_all
+    -- can compare, say, a C++ and a Python attempt side by side. A file qualifies
+    -- when its filetype has a run_command and it isn't a helper (checker/gen/…) or a header.
+    local paths = vim.tbl_map(function(f)
+        return { path = f, ft = candidate_filetype(f) }
+    end, tools.solutions_in(dir, cfg, candidate_filetype))
+    if #paths == 0 then
+        local where = curpath and "beside " .. vim.fn.fnamemodify(curpath, ":t") or "in " .. dir
+        utils.notify(
+            ("run_all: no runnable solution files found %s. Open or `cd` into the "):format(where)
+                .. "problem folder, and make sure it holds source files with a configured "
+                .. "run_command (helpers like gen/brute/checker/interactor are excluded).",
+            "WARN"
+        )
+        return
+    end
+
+    -- Flush buffers before running: run_all runs *every* sibling version.
+    local function save()
+        tools.save_sources(bufnr, cfg)
+        if cfg.save_current_file or cfg.save_all_files then
+            for _, p in ipairs(paths) do
+                tools.flush_buffer(p.path)
+            end
+        end
+    end
+    if not opts.show_only then
+        save()
+    end
+
+    -- With a real solution buffer, use its testcases directly. Otherwise anchor on a
+    -- discovered solution so shared testcases (e.g. `input0.txt`) are still found.
+    local tctbl = curpath and testcases.buf_get_testcases(bufnr) or testcases.get_testcases(paths[1].path, cfg)
+    local nums = vim.tbl_keys(tctbl)
+    table.sort(nums)
+    if opts.list then
+        -- Named testcases, as `:Tuna run 2 3` names them in normal mode: each missing one
+        -- is reported, and with none left there is nothing to run.
+        local chosen = {}
+        for _, s in ipairs(opts.list) do
+            local n = tonumber(s)
+            if n and tctbl[n] then
+                chosen[n] = true
+            else
+                utils.notify("run: testcase " .. s .. " doesn't exist.")
+            end
+        end
+        nums = vim.tbl_keys(chosen)
+        table.sort(nums)
+        if #nums == 0 then
+            return
+        end
+    elseif #nums == 0 then
+        -- Nothing to test, as in a normal run: every solution runs once on empty stdin, on a
+        -- bare testcase 0 that typing into and saving makes the first testcase.
+        nums = { 0 }
+    end
+
+    -- Resolve each solution's run/compile commands from *its own* filetype, and the
+    -- shared checker. So a C++ and a Python attempt each compile/run correctly.
+    local files = {}
+    for i, p in ipairs(paths) do
+        local f, ft = p.path, p.ft
+        files[i] = {
+            si = i,
+            name = vim.fn.fnamemodify(f, ":t"),
+            path = f,
+            rc = cfg.run_command[ft] and utils.eval_command(f, cfg.run_command[ft]) or nil,
+            cc = cfg.compile_command[ft] and utils.eval_command(f, cfg.compile_command[ft]) or nil,
+        }
+    end
+
+    local timeout = core.time_limit(cfg)
+
+    if M.active[bufnr] then
+        M.active[bufnr]:kill_all_processes()
+        M.active[bufnr]:delete_ui()
+    end
+
+    local mr = setmetatable({
+        config = cfg,
+        bufnr = bufnr,
+        checker = tools.resolve_checker(curpath or paths[1].path, cfg),
+        -- The solution helpers and the checker are looked up against.
+        solution = curpath or paths[1].path,
+        compare_method = tools.get_compare(vim.api.nvim_buf_get_name(bufnr)), -- per-buffer `:Tuna compare` override
+        mode = "all",
+        files = files,
+        subset = opts.list ~= nil,
+        -- Testcase edits from the UI are resolved against a real solution: the
+        -- invoking buffer may be a scratch one that owns no testcases of its own.
+        edit_anchor = not curpath and paths[1].path or nil,
+        rundir = utils.normalize_path(cfg.running_directory, dir) .. "/",
+        compdir = utils.normalize_path(cfg.compile_directory, dir) .. "/",
+        timeout = timeout,
+        tcdata = {},
+        completed = false,
+    }, MultiRunner)
+    core.register(M.active, bufnr, mr)
+    utils.ensure_directory(mr.rundir)
+
+    -- Rows first, and marked before the board opens, so it opens on the row it will show
+    -- (see interactive).
+    mr:lay_out(nums, tctbl, "", "TunaRunning")
+    if opts.show_only then
+        mr:mark_not_run()
+    end
+    mr:show_ui()
+    if opts.show_only then
+        -- Listed, not run: the first run key saves and runs the matrix (`built_first`),
+        -- `run_all` compiling every solution first.
+        mr.completed = true
+        mr.build = function(cont)
+            save()
+            cont()
+        end
+        mr:update_ui(true)
+        return
+    end
+    mr:update_ui(true)
+    mr:run_all()
+end
+
+---Open the run-all UI for a buffer with its rows listed and nothing run.
+---@param bufnr integer
+function M.show(bufnr)
+    M.run(bufnr, { show_only = true })
+end
+
+return M

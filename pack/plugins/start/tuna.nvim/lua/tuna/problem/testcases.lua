@@ -1,0 +1,1178 @@
+-- lua/tuna/problem/testcases.lua
+--
+-- Reads and writes testcases. A "testcase table" (tctbl) maps a 0-based index
+-- to `{ input = string?, output = string? }`. Three interchangeable storage
+-- backends produce and consume that shape:
+--
+--   * `files`       — a pair of text files per testcase   (e.g. task_input0.txt)
+--   * `single_file` — one msgpack-encoded file
+--   * `directory`   — one sub-directory per testcase       (e.g. tests/0/input.txt)
+--
+-- Pure functions (`load`/`write`) take explicit paths and formats; the
+-- `buf_*` wrappers derive those from a buffer's resolved config. The module-level
+-- `buf_get_testcases` / `buf_write_testcases` dispatch to the configured backend
+-- (with auto-detect fallback) so callers stay backend-agnostic.
+
+local config = require("tuna.config")
+local utils = require("tuna.utils")
+
+---What every storage backend answers to, by a solution's path and config or by its buffer.
+---@class tuna.TestcaseBackend
+---@field path_load fun(filepath: string, cfg: table): table<integer, tuna.StoredTestcase>
+---@field path_write fun(filepath: string, cfg: table, tctbl: table<integer, tuna.StoredTestcase>)
+---@field buf_load fun(bufnr: integer): table<integer, tuna.StoredTestcase>
+---@field buf_write fun(bufnr: integer, tctbl: table<integer, tuna.StoredTestcase>)
+---@field buf_clear fun(bufnr: integer)
+
+local M = {}
+
+---@class tuna.FilesBackend: tuna.TestcaseBackend
+M.files = {}
+---@class tuna.SingleFileBackend: tuna.TestcaseBackend
+M.single_file = {}
+---@class tuna.DirectoryBackend: tuna.TestcaseBackend
+M.directory = {}
+
+---One testcase as stored. `keep_empty` rides along on a write only: which empty halves are to
+---be written as empty files rather than removed (see `write_or_delete`).
+---@class tuna.StoredTestcase
+---@field input string?
+---@field output string?
+---@field keep_empty { input: boolean?, output: boolean? }?
+
+---------------- SHARED HELPERS ----------------
+
+---Split a format on the literal `$(TCNUM)` marker and evaluate the file-format
+---modifiers in each part. The pieces around `$(TCNUM)` become the constant
+---parts of a file/directory name.
+---@param filepath string source file path, used to evaluate modifiers
+---@param format string format string containing `$(TCNUM)`
+---@return string[]? # evaluated parts, or `nil` on a malformed format
+local function eval_format_parts(filepath, format)
+    local parts = vim.split(format, "$(TCNUM)", { plain = true })
+    for i, part in ipairs(parts) do
+        local evaluated = utils.eval_string(filepath, part)
+        if evaluated == nil then
+            return nil
+        end
+        parts[i] = evaluated
+    end
+    return parts
+end
+
+---Build a concrete name for a testcase by joining `parts` with the number.
+---@param parts string[]
+---@param tcnum integer
+---@return string
+local function format_name(parts, tcnum)
+    return table.concat(parts, tostring(tcnum))
+end
+
+---Normalize a file-format option (string or list of strings) to a list.
+---@param fmt string|string[]
+---@return string[]
+local function normalize_formats(fmt)
+    if type(fmt) == "table" then
+        return fmt
+    end
+    return { fmt }
+end
+
+---Escape Lua pattern magic characters in `s`.
+---@param s string
+---@return string
+local function escape_pattern(s)
+    return (s:gsub("(%W)", "%%%1"))
+end
+
+---Build an anchored Lua pattern matching names produced from `parts`, capturing
+---the testcase number(s) where `$(TCNUM)` was.
+---@param parts string[]
+---@return string
+local function format_pattern(parts)
+    local escaped = {}
+    for i, part in ipairs(parts) do
+        escaped[i] = escape_pattern(part)
+    end
+    return "^" .. table.concat(escaped, "(%d+)") .. "$"
+end
+
+---Match a name against a pattern, returning the testcase number. When a format
+---contains several `$(TCNUM)` the captures must all agree.
+---@param name string
+---@param pattern string
+---@return integer?
+local function match_tcnum(name, pattern)
+    local caps = { name:match(pattern) }
+    if #caps == 0 then
+        return nil
+    end
+    local value = caps[1]
+    for _, c in ipairs(caps) do
+        if c ~= value then
+            return nil
+        end
+    end
+    return tonumber(value)
+end
+
+---Build a matcher `fun(name) -> tcnum?` for a format's evaluated `parts`. A format
+---with `$(TCNUM)` (≥2 parts) matches numbered names; a **numberless** format (one
+---part, e.g. `out.txt`) names a single testcase and maps an exact match to index 0.
+---@param parts string[]
+---@return fun(name: string): integer?
+local function make_matcher(parts)
+    if #parts <= 1 then
+        local exact = parts[1] or ""
+        return function(name)
+            return name == exact and 0 or nil
+        end
+    end
+    local pattern = format_pattern(parts)
+    return function(name)
+        return match_tcnum(name, pattern)
+    end
+end
+
+---Write `content` to `path`, or delete `path` when `content` is empty/nil.
+---
+---`keep_empty` is the deliberate exception, and the only way to put an empty file on
+---disk. An empty file is not the same thing as an absent one: an empty *input* file is
+---what makes a testcase exist with nothing to feed it, and an empty *answer* file is
+---the instruction to expect no output, as against no answer at all. Nothing sets it by
+---accident; it comes from a question the user answered.
+---@param path string
+---@param content string?
+---@param keep_empty boolean? write an empty file rather than removing it
+local function write_or_delete(path, content, keep_empty)
+    if not content or content == "" then
+        if keep_empty then
+            utils.write_file(path, "")
+        elseif utils.file_exists(path) then
+            utils.delete_file(path)
+        end
+    else
+        utils.write_file(path, content)
+    end
+end
+
+---The mirror of `write_or_delete`, applied to everything a backend loads. It normalizes
+---the **input** only, and the asymmetry is the point: for an input, empty and absent
+---really are the same thing — the process is fed `""` either way — so nothing is lost
+---by saying so once, and a load and a save never disagree about it.
+---
+---For an **answer** they are two different things, so nothing may be normalized away:
+---an absent answer means the testcase is not judged (`compare_output` returns nil, the
+---verdict is DONE), while an answer that is present and empty means the solution must
+---print nothing. Only file *presence* can carry that, which is why an empty answer is
+---never written by accident — `write_or_delete` removes it unless `keep_empty` says the
+---user asked for one — and why what is there must be loaded as it is.
+---@param tctbl table<integer, tuna.StoredTestcase>
+---@return table<integer, tuna.StoredTestcase>
+local function as_stored(tctbl)
+    for _, tc in pairs(tctbl) do
+        if tc.input == "" then
+            tc.input = nil
+        end
+    end
+    return tctbl
+end
+
+---------------- FILES BACKEND (one input/output file per testcase) ----------------
+
+---The names of the files in `directory`, read once for everything a load decides.
+---@param directory string
+---@return string[]
+local function files_in(directory)
+    local names = {}
+    if utils.directory_exists(directory) then
+        for name, type_ in vim.fs.dir(directory) do
+            if type_ == "file" then
+                names[#names + 1] = name
+            end
+        end
+    end
+    return names
+end
+
+---Which of the configured format pairs this directory is *actually* using: the first
+---one that matches a file already there, else the first configured (canonical) pair.
+---
+---Both loading and writing go through this, so a testcase added to a folder whose
+---testcases are named by a fallback format (the shared, un-prefixed `input<N>.txt` a
+---download or another solution wrote) joins that set instead of starting a second,
+---source-named one beside it — which, since the first format to match anything wins
+---on load, would have hidden every testcase already there.
+---@param directory string
+---@param filepath string
+---@param input_format string|string[] one format, or an ordered list; the first format
+---  that discovers any testcase wins
+---@param output_format string|string[] paired with `input_format` by index
+---@param entries string[]? the directory's files, when the caller has read them already
+---@return string[]? in_parts, string[]? out_parts
+function M.files.active_parts(directory, filepath, input_format, output_format, entries)
+    local in_formats = normalize_formats(input_format)
+    local out_formats = normalize_formats(output_format)
+    entries = entries or files_in(directory)
+
+    local first_in, first_out
+    for i, in_fmt in ipairs(in_formats) do
+        local in_parts = eval_format_parts(filepath, in_fmt)
+        local out_parts = eval_format_parts(filepath, out_formats[i] or out_formats[1])
+        if in_parts and out_parts then
+            first_in = first_in or in_parts
+            first_out = first_out or out_parts
+            local match_in = make_matcher(in_parts)
+            local match_out = make_matcher(out_parts)
+            for _, name in ipairs(entries) do
+                if match_in(name) or match_out(name) then
+                    return in_parts, out_parts
+                end
+            end
+        end
+    end
+    return first_in, first_out
+end
+
+---@param directory string testcase directory (with trailing slash)
+---@param filepath string source file path
+---@param input_format string|string[]
+---@param output_format string|string[]
+---@return table<integer, tuna.StoredTestcase>
+function M.files.load(directory, filepath, input_format, output_format)
+    local entries = files_in(directory)
+    if #entries == 0 then
+        return {}
+    end
+    local in_parts, out_parts = M.files.active_parts(directory, filepath, input_format, output_format, entries)
+    if not (in_parts and out_parts) then
+        return {}
+    end
+
+    local match_in = make_matcher(in_parts)
+    local match_out = make_matcher(out_parts)
+    local tctbl = {}
+    for _, name in ipairs(entries) do
+        -- A testcase may have only an input or only an output (an output with no
+        -- matching input still runs — the solution is fed empty stdin).
+        local tcnum = match_in(name)
+        if tcnum then
+            tctbl[tcnum] = tctbl[tcnum] or {}
+            tctbl[tcnum].input = utils.read_file(directory .. name)
+        else
+            tcnum = match_out(name)
+            if tcnum then
+                tctbl[tcnum] = tctbl[tcnum] or {}
+                tctbl[tcnum].output = utils.read_file(directory .. name)
+            end
+        end
+    end
+    return as_stored(tctbl)
+end
+
+---@param directory string testcase directory (with trailing slash)
+---@param tctbl table<integer, tuna.StoredTestcase>
+---@param filepath string source file path
+---@param input_format string|string[]
+---@param output_format string|string[]
+function M.files.write(directory, tctbl, filepath, input_format, output_format)
+    -- Write with the format this directory already uses (the canonical first one when
+    -- it holds no testcases yet), so a new testcase joins the set that is there rather
+    -- than starting a rival one under another name.
+    local in_parts, out_parts = M.files.active_parts(directory, filepath, input_format, output_format)
+    if not in_parts or not out_parts then
+        return
+    end
+    for tcnum, tc in pairs(tctbl) do
+        local keep = tc.keep_empty or {}
+        write_or_delete(directory .. format_name(in_parts, tcnum), tc.input, keep.input)
+        write_or_delete(directory .. format_name(out_parts, tcnum), tc.output, keep.output)
+    end
+end
+
+---------------- SINGLE-FILE BACKEND (one msgpack file) ----------------
+
+---@param path string single file path
+---@return table<integer, tuna.StoredTestcase>
+function M.single_file.load(path)
+    -- raw read: msgpack is binary and must not have CRLF rewritten
+    local content = utils.read_file(path, true)
+    if not content then
+        return {}
+    end
+    local ok, decoded = pcall(vim.mpack.decode, content)
+    if ok and type(decoded) == "table" then
+        return as_stored(decoded)
+    end
+    return {}
+end
+
+---@param path string single file path
+---@param tctbl table<integer, tuna.StoredTestcase>
+function M.single_file.write(path, tctbl)
+    -- drop empty inputs/outputs, then drop testcases that became empty
+    for tcnum, tc in pairs(tctbl) do
+        local keep = tc.keep_empty or {}
+        if tc.input == "" then
+            tc.input = nil
+        end
+        -- An empty answer the user asked to keep is the instruction to expect no
+        -- output, and this backend has no file of its own to leave behind, so it says
+        -- it by keeping the empty string in the entry.
+        if tc.output == "" and not keep.output then
+            tc.output = nil
+        end
+        -- An entry with both halves gone is no testcase at all, so it is dropped —
+        -- unless the user asked to keep it, which is recorded the same way.
+        if not tc.input and not tc.output and not keep.input then
+            tctbl[tcnum] = nil
+        end
+        tc.keep_empty = nil
+    end
+
+    if next(tctbl) == nil then
+        if utils.file_exists(path) then
+            utils.delete_file(path)
+        end
+    else
+        utils.write_file(path, vim.mpack.encode(tctbl))
+    end
+end
+
+---------------- DIRECTORY BACKEND (one sub-directory per testcase) ----------------
+
+---Resolve the directory format into a scan directory, a name pattern (capturing
+---the testcase number) and the constant parts used to rebuild a directory name.
+---Assumes the `$(TCNUM)` marker lives in the last path component.
+---@param base_dir string testcase base directory (with trailing slash)
+---@param filepath string source file path
+---@param dir_format string e.g. "tests/$(TCNUM)"
+---@return { scan_dir: string, pattern: string }? layout
+local function resolve_directory_layout(base_dir, filepath, dir_format)
+    local parts = eval_format_parts(filepath, dir_format)
+    if not parts or #parts < 2 then
+        return nil -- the format must contain $(TCNUM)
+    end
+    -- Split the prefix part at its last path separator: the leading portion is a
+    -- real directory (joined onto base_dir and normalized), the trailing portion
+    -- is a literal prefix on each testcase directory's name. Deriving this from
+    -- the format string (not the normalized path) preserves the separator that
+    -- distinguishes "tests/$(TCNUM)" (dirs named "0") from "tc$(TCNUM)" ("tc0").
+    local name_prefix = parts[1]:match("[^/]*$")
+    local format_dir = parts[1]:sub(1, #parts[1] - #name_prefix)
+    local scan_dir = vim.fs.normalize(base_dir .. format_dir) .. "/"
+    local suffix = table.concat(parts, "", 2)
+    local pattern = "^" .. escape_pattern(name_prefix) .. "(%d+)" .. escape_pattern(suffix) .. "$"
+    return { scan_dir = scan_dir, pattern = pattern }
+end
+
+---@param base_dir string testcase base directory (with trailing slash)
+---@param filepath string source file path
+---@param dir_format string
+---@param input_name string input file name inside each testcase directory
+---@param output_name string output file name inside each testcase directory
+---@return table<integer, tuna.StoredTestcase>
+function M.directory.load(base_dir, filepath, dir_format, input_name, output_name)
+    local layout = resolve_directory_layout(base_dir, filepath, dir_format)
+    if not layout then
+        return {}
+    end
+
+    local tctbl = {}
+    if not utils.directory_exists(layout.scan_dir) then
+        return tctbl
+    end
+    for name, type_ in vim.fs.dir(layout.scan_dir) do
+        if type_ == "directory" then
+            local tcnum = match_tcnum(name, layout.pattern)
+            if tcnum then
+                local tcdir = layout.scan_dir .. name .. "/"
+                tctbl[tcnum] = {
+                    input = utils.read_file(tcdir .. input_name),
+                    output = utils.read_file(tcdir .. output_name),
+                }
+            end
+        end
+    end
+    return as_stored(tctbl)
+end
+
+---@param base_dir string testcase base directory (with trailing slash)
+---@param tctbl table<integer, tuna.StoredTestcase>
+---@param filepath string source file path
+---@param dir_format string
+---@param input_name string
+---@param output_name string
+function M.directory.write(base_dir, tctbl, filepath, dir_format, input_name, output_name)
+    local parts = eval_format_parts(filepath, dir_format)
+    if not parts then
+        return
+    end
+    for tcnum, tc in pairs(tctbl) do
+        local tcdir = vim.fs.normalize(base_dir .. format_name(parts, tcnum)) .. "/"
+        local keep = tc.keep_empty or {}
+        local empty = (not tc.input or tc.input == "") and (not tc.output or tc.output == "")
+        if empty and not (keep.input or keep.output) then
+            -- Remove the testcase's files, then every directory the format made for it that
+            -- is now empty (`tests/0`, then `tests`), up to the store's root, which is left
+            -- alone: a layout converted away from, or emptied, leaves nothing behind.
+            write_or_delete(tcdir .. input_name, nil)
+            write_or_delete(tcdir .. output_name, nil)
+            local root = vim.fs.normalize(base_dir)
+            local dir = vim.fs.normalize(tcdir)
+            while dir:sub(1, #root + 1) == root .. "/" and vim.uv.fs_rmdir(dir) do
+                dir = vim.fs.dirname(dir)
+            end
+        else
+            utils.ensure_directory(tcdir)
+            write_or_delete(tcdir .. input_name, tc.input, keep.input)
+            write_or_delete(tcdir .. output_name, tc.output, keep.output)
+        end
+    end
+end
+
+---------------- BUFFER LAYER ----------------
+
+---@private
+---Paths already warned about, so the notice below is shown once per session.
+---@type table<string, true>
+local warned_shared = {}
+
+---@private
+---Whether the configured value carries a modifier that varies per problem. `$(HOME)`
+---and the `$()` escape do not — `"$(HOME)/cp/testcases"` is the same directory for
+---every problem exactly as `"~/cp/testcases"` is, and the two spellings must be
+---judged alike. `$(CWD)` counts as scoping: tuna moves the cwd into each downloaded
+---problem, so a `$(CWD)`-based path follows the problem for the workflow it serves.
+---@param raw string
+---@return boolean
+local function has_scoping_modifier(raw)
+    for name in raw:gmatch("%$%(([^)]*)%)") do
+        if name ~= "" and name ~= "HOME" then
+            return true
+        end
+    end
+    return false
+end
+
+---@private
+---An absolute `testcases_directory` carrying no modifier is the *same* directory for
+---every problem, and every storage backend names its files after the source
+---(`$(FNOEXT)_input0.txt`, `tests/0`, …) — so two problems silently overwrite each
+---other's testcases there. Say so once, with the fix, rather than letting the data
+---go. A value coming from a directory's own `.tuna.lua` already scopes itself to that
+---tree, so only a globally configured one is worth flagging.
+---@param raw string the configured value
+---@param expanded string the same value after modifier/`~` expansion
+local function warn_if_shared(raw, expanded)
+    if warned_shared[raw] or has_scoping_modifier(raw) or not utils.is_absolute(expanded) then
+        return
+    end
+    if raw ~= config.current_setup.testcases_directory then
+        return -- a local config's value: scoped to its own tree by construction
+    end
+    warned_shared[raw] = true
+    utils.notify(
+        "testcases_directory '"
+            .. raw
+            .. "' is an absolute path with no per-problem component, so every problem stores its "
+            .. "testcases there and overwrites the others'. Add a modifier, e.g. '"
+            .. raw
+            .. "/$(DIRNAME)'.",
+        vim.log.levels.WARN
+    )
+end
+
+---Absolute testcase base directory for a source file (with trailing slash).
+---
+---`testcases_directory` is evaluated for file modifiers — so `$(DIRNAME)`, `$(HOME)`,
+---`$(CWD)`, `$(FNOEXT)`… can build a per-problem path — and the result is used as-is
+---when it is absolute, joined onto the source's directory when it is not.
+---@param source_dir string directory holding the source file
+---@param filepath string source file path, which the modifiers are computed from
+---@param cfg table resolved configuration
+---@return string # absolute directory, with exactly one trailing slash
+function M.tc_directory(source_dir, filepath, cfg)
+    local raw = cfg.testcases_directory or "."
+    local expanded = utils.eval_string(filepath, raw)
+    if not expanded then
+        utils.notify("testcases_directory: could not evaluate '" .. raw .. "'.", vim.log.levels.WARN)
+        expanded = raw
+    end
+    expanded = utils.expand_home(expanded)
+    warn_if_shared(raw, expanded)
+    return (utils.normalize_path(expanded, source_dir):gsub("/*$", "")) .. "/"
+end
+
+---The testcases directory of the solution at `filepath`, with no buffer needed.
+---@param filepath string
+---@param cfg table
+---@return string
+local function path_tc_directory(filepath, cfg)
+    return M.tc_directory(vim.fn.fnamemodify(filepath, ":p:h"), filepath, cfg)
+end
+
+-- Each backend reads and writes by the solution's path and its resolved config (`path_load`,
+-- `path_write`): a problem being downloaded has no buffer yet, and run-all may be started from
+-- one that is not a solution. The `buf_*` forms are the same for a buffer's file and config.
+
+-- files
+function M.files.path_load(filepath, cfg)
+    return M.files.load(
+        path_tc_directory(filepath, cfg),
+        filepath,
+        cfg.testcases_input_file_format,
+        cfg.testcases_output_file_format
+    )
+end
+
+function M.files.path_write(filepath, cfg, tctbl)
+    M.files.write(
+        path_tc_directory(filepath, cfg),
+        tctbl,
+        filepath,
+        cfg.testcases_input_file_format,
+        cfg.testcases_output_file_format
+    )
+end
+
+-- single_file
+local function single_file_path(filepath, cfg)
+    return path_tc_directory(filepath, cfg) .. utils.eval_string(filepath, cfg.testcases_single_file_format)
+end
+
+function M.single_file.path_load(filepath, cfg)
+    return M.single_file.load(single_file_path(filepath, cfg))
+end
+
+function M.single_file.path_write(filepath, cfg, tctbl)
+    M.single_file.write(single_file_path(filepath, cfg), tctbl)
+end
+
+-- directory
+function M.directory.path_load(filepath, cfg)
+    return M.directory.load(
+        path_tc_directory(filepath, cfg),
+        filepath,
+        cfg.testcases_directory_format,
+        cfg.testcases_directory_input,
+        cfg.testcases_directory_output
+    )
+end
+
+function M.directory.path_write(filepath, cfg, tctbl)
+    M.directory.write(
+        path_tc_directory(filepath, cfg),
+        tctbl,
+        filepath,
+        cfg.testcases_directory_format,
+        cfg.testcases_directory_input,
+        cfg.testcases_directory_output
+    )
+end
+
+for _, backend in ipairs({ M.files, M.single_file, M.directory }) do
+    backend.buf_load = function(bufnr)
+        return backend.path_load(vim.api.nvim_buf_get_name(bufnr), config.get_buffer_config(bufnr))
+    end
+    backend.buf_write = function(bufnr, tctbl)
+        backend.path_write(vim.api.nvim_buf_get_name(bufnr), config.get_buffer_config(bufnr), tctbl)
+    end
+end
+
+function M.files.buf_clear(bufnr)
+    -- Delete every file matching any configured input/output format — not just the
+    -- canonical one — so `convert` cleans up testcases that were discovered through a
+    -- fallback format (e.g. shared `input0.txt`) too.
+    local cfg = config.get_buffer_config(bufnr)
+    local filepath = vim.api.nvim_buf_get_name(bufnr)
+    local directory = path_tc_directory(filepath, cfg)
+    if not utils.directory_exists(directory) then
+        return
+    end
+    local matchers = {}
+    local both = {}
+    vim.list_extend(both, normalize_formats(cfg.testcases_input_file_format))
+    vim.list_extend(both, normalize_formats(cfg.testcases_output_file_format))
+    for _, fmt in ipairs(both) do
+        local parts = eval_format_parts(filepath, fmt)
+        if parts then
+            matchers[#matchers + 1] = make_matcher(parts)
+        end
+    end
+    for name, type_ in vim.fs.dir(directory) do
+        if type_ == "file" then
+            for _, match in ipairs(matchers) do
+                if match(name) then
+                    utils.delete_file(directory .. name)
+                    break
+                end
+            end
+        end
+    end
+end
+function M.single_file.buf_clear(bufnr)
+    M.single_file.buf_write(bufnr, {})
+end
+function M.directory.buf_clear(bufnr)
+    local tctbl = M.directory.buf_load(bufnr)
+    for tcnum in pairs(tctbl) do
+        tctbl[tcnum] = {} -- empty input/output → deleted on write
+    end
+    M.directory.buf_write(bufnr, tctbl)
+end
+
+---------------- DISPATCHER ----------------
+
+---@type table<string, tuna.TestcaseBackend>
+M.backends = {
+    files = M.files,
+    single_file = M.single_file,
+    directory = M.directory,
+}
+
+-- The order auto-detection tries the backends in. A fixed list, not `pairs` over
+-- `M.backends`: if two backends both hold data, which one answers must not depend on
+-- table hash order.
+M.BACKEND_ORDER = { "files", "single_file", "directory" }
+
+---Return the backend for a storage mode, defaulting to `files`.
+---@param storage string?
+---@return tuna.TestcaseBackend
+function M.backend(storage)
+    return M.backends[storage] or M.files
+end
+
+---Load all testcases for a buffer using the configured backend, falling back to
+---the other backends when auto-detect is on and the primary found nothing.
+---@param bufnr integer
+---@return table<integer, tuna.StoredTestcase>
+function M.buf_get_testcases(bufnr)
+    return M.get_testcases(vim.api.nvim_buf_get_name(bufnr), config.get_buffer_config(bufnr))
+end
+
+---The testcases of the solution at `filepath`, with no buffer needed (run-all launched from a
+---buffer that is not a solution): the configured backend, else the others in a fixed order.
+---@param filepath string
+---@param cfg table resolved config
+---@return table<integer, tuna.StoredTestcase>
+function M.get_testcases(filepath, cfg)
+    local primary = M.backend(cfg.testcases_storage)
+    local tctbl = primary.path_load(filepath, cfg)
+    if next(tctbl) == nil and cfg.testcases_auto_detect_storage then
+        for _, name in ipairs(M.BACKEND_ORDER) do
+            local backend = M.backends[name]
+            if backend ~= primary then
+                tctbl = backend.path_load(filepath, cfg)
+                if next(tctbl) ~= nil then
+                    break
+                end
+            end
+        end
+    end
+    return tctbl
+end
+
+---Mark testcases read from a store to be written back exactly as they are. A write that
+---rewrites testcases it is not changing (a single-file save or delete, which rewrites the
+---whole file, and a conversion) would otherwise go by the bulk rule, empty means absent,
+---and drop a stored empty testcase and turn an expected empty answer into no answer.
+---@param tctbl table<integer, table>
+---@return table<integer, table>
+local function keep_stored(tctbl)
+    for _, entry in pairs(tctbl) do
+        entry.keep_empty = { input = true, output = entry.output == "" or nil }
+    end
+    return tctbl
+end
+
+---Move a buffer's testcases into another storage backend, exactly as they are stored: the
+---backend holding them now is detected, every backend's files are removed, and the target's
+---are written. Exactly, because the bulk rule ("empty means absent") would turn an answer
+---that is stored empty, the instruction to expect no output, into no answer at all.
+---@param bufnr integer
+---@param target string "files" | "single_file" | "directory"
+---@return integer count how many testcases were moved, 0 when there were none
+function M.buf_convert(bufnr, target)
+    local tctbl = M.buf_get_testcases(bufnr)
+    local count = vim.tbl_count(tctbl)
+    if count == 0 then
+        return 0
+    end
+    for _, backend in pairs(M.backends) do
+        backend.buf_clear(bufnr)
+    end
+    M.buf_write_testcases(bufnr, keep_stored(tctbl), target)
+    return count
+end
+
+---Write a full testcase table for a buffer.
+---@param bufnr integer
+---@param tctbl table<integer, tuna.StoredTestcase>
+---@param storage string? override the configured storage mode
+function M.buf_write_testcases(bufnr, tctbl, storage)
+    local cfg = config.get_buffer_config(bufnr)
+    M.backend(storage or cfg.testcases_storage).buf_write(bufnr, tctbl)
+end
+
+---Write a full testcase table for the solution at `filepath`, with no buffer needed (a
+---problem being downloaded), through the backend `cfg` stores testcases with.
+---@param filepath string
+---@param cfg table resolved config for the solution's directory
+---@param tctbl table<integer, tuna.StoredTestcase>
+function M.write_testcases(filepath, cfg, tctbl)
+    M.backend(cfg.testcases_storage).path_write(filepath, cfg, tctbl)
+end
+
+---Remove every testcase a buffer stores, using its configured backend.
+---@param bufnr integer
+function M.buf_clear(bufnr)
+    local cfg = config.get_buffer_config(bufnr)
+    M.backend(cfg.testcases_storage).buf_clear(bufnr)
+end
+
+---Create or replace a single testcase for a buffer. Saving a testcase **stores** it,
+---even with nothing in it: an empty input is written as an empty file rather than as
+---the removal an empty write means in bulk, so a testcase never disappears because it
+---was saved. Removing one is `buf_delete_testcase`, which is what the runner UI's
+---delete key and `:Tuna testcase delete` call — one way in, and an undoable one.
+---
+---The **answer** is the exception, because an empty one is ambiguous where an empty
+---input is not: absent means the testcase is not judged, present-and-empty means the
+---solution must print nothing. `expect_empty_output` picks the second; without it an
+---empty answer is stored as absent.
+---@param bufnr integer
+---@param tcnum integer
+---@param input string?
+---@param output string?
+---@param expect_empty_output boolean? store an empty answer as an empty *file*, so the
+---testcase is judged and the solution must print nothing
+function M.buf_save_testcase(bufnr, tcnum, input, output, expect_empty_output)
+    local cfg = config.get_buffer_config(bufnr)
+    local entry = {
+        input = input,
+        output = output,
+        keep_empty = { input = true, output = expect_empty_output or nil },
+    }
+    if cfg.testcases_storage == "single_file" then
+        -- single file holds everything, so edit the whole table and rewrite
+        local tctbl = keep_stored(M.single_file.buf_load(bufnr))
+        tctbl[tcnum] = entry
+        M.single_file.buf_write(bufnr, tctbl)
+    else
+        M.backend(cfg.testcases_storage).buf_write(bufnr, { [tcnum] = entry })
+    end
+end
+
+---Delete a single testcase for a buffer.
+---@param bufnr integer
+---@param tcnum integer
+function M.buf_delete_testcase(bufnr, tcnum)
+    local cfg = config.get_buffer_config(bufnr)
+    if cfg.testcases_storage == "single_file" then
+        local tctbl = keep_stored(M.single_file.buf_load(bufnr))
+        tctbl[tcnum] = nil
+        M.single_file.buf_write(bufnr, tctbl)
+    else
+        M.backend(cfg.testcases_storage).buf_write(bufnr, { [tcnum] = {} })
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Sharing a folder's testcases between its solutions
+--------------------------------------------------------------------------------
+
+---How to share one solution's testcases with every solution in its folder, for a solution
+---that has none: the files to rename, from the names that carry the owner's file name
+---(`main_input0.txt`) to the first configured `files` format pair that names the same file
+---for every solution there (`input0.txt`), which each of them falls back to on load, and is
+---numbered: a name without a number holds testcase 0 alone. Only
+---offered when the folder holds one set of testcases, `owner`'s, so it is one problem and
+---the shared names cannot be read by a solution of another problem.
+---@class tuna.SharePlan
+---@field owner string the solution whose testcases are shared
+---@field moves { from: string, to: string }[] absolute paths
+
+---The plan for sharing a folder's testcases with `filepath`, or nil when there is nothing
+---to share: `filepath` has testcases of its own, no solution or more than one in `siblings`
+---has any, they are not stored as `files`, or no configured numbered format names a file
+---every solution there would read (each carries the file's name, or `testcases_directory`
+---does).
+---@param filepath string absolute path of the solution with no testcases
+---@param siblings string[] absolute paths of the other solutions in its folder
+---@param cfg table
+---@return tuna.SharePlan?
+function M.share_plan(filepath, siblings, cfg)
+    if next(M.get_testcases(filepath, cfg)) ~= nil then
+        return nil
+    end
+    local owners = vim.tbl_filter(function(sibling)
+        return sibling ~= filepath and next(M.get_testcases(sibling, cfg)) ~= nil
+    end, siblings)
+    if #owners ~= 1 then
+        return nil
+    end
+    local owner = owners[1]
+    local tctbl = M.files.path_load(owner, cfg)
+    local directory = path_tc_directory(owner, cfg)
+    if next(tctbl) == nil or directory ~= path_tc_directory(filepath, cfg) then
+        return nil
+    end
+
+    local in_formats = normalize_formats(cfg.testcases_input_file_format)
+    local out_formats = normalize_formats(cfg.testcases_output_file_format)
+    local own_in, own_out = M.files.active_parts(directory, owner, in_formats, out_formats)
+    local to_in, to_out
+    for i, in_fmt in ipairs(in_formats) do
+        local out_fmt = out_formats[i] or out_formats[1]
+        local in_parts, out_parts = eval_format_parts(owner, in_fmt), eval_format_parts(owner, out_fmt)
+        local shared = in_parts
+            and out_parts
+            and vim.deep_equal(in_parts, eval_format_parts(filepath, in_fmt))
+            and vim.deep_equal(out_parts, eval_format_parts(filepath, out_fmt))
+            and #in_parts > 1
+            and #out_parts > 1
+        if shared then
+            to_in, to_out = in_parts, out_parts
+            break
+        end
+    end
+    if not (to_in and to_out and own_in and own_out) then
+        return nil
+    end
+
+    local match_in, match_out = make_matcher(own_in), make_matcher(own_out)
+    local moves = {}
+    for _, name in ipairs(files_in(directory)) do
+        local n, parts = match_in(name), to_in
+        if not n then
+            n, parts = match_out(name), to_out
+        end
+        if n then
+            moves[#moves + 1] = { from = directory .. name, to = directory .. format_name(parts, n) }
+        end
+    end
+    table.sort(moves, function(a, b)
+        return a.from < b.from
+    end)
+    return { owner = owner, moves = moves }
+end
+
+--------------------------------------------------------------------------------
+-- Splitting a testcase: lifting out the cases its markers bracket
+--------------------------------------------------------------------------------
+
+---`n` of `thing`, pluralised.
+---@param n integer
+---@param thing string
+---@return string
+local function count(n, thing)
+    return n .. " " .. thing .. (n == 1 and "" or "s")
+end
+
+---Whether `line` is a marker: nothing but repetitions of `char`.
+---
+---Any run of the character counts, so a `-` marker and the `----` people actually
+---type are the same thing, and the count needn't be consistent between markers. The
+---whole line has to be it, or a line like `1 2 -3` would cut a case in half.
+---@param line string
+---@param char string
+---@return boolean
+local function is_marker(line, char)
+    local trimmed = vim.trim(line)
+    return trimmed ~= "" and trimmed:match("^" .. vim.pesc(char) .. "+$") ~= nil
+end
+
+---Join a block of lines back into testcase text, dropping trailing blank lines.
+---@param lines string[]
+---@return string
+local function join(lines)
+    local out = vim.deepcopy(lines)
+    while #out > 0 and vim.trim(out[#out]) == "" do
+        table.remove(out)
+    end
+    return #out > 0 and (table.concat(out, "\n") .. "\n") or ""
+end
+
+---Take `text` apart into the regions its markers bracket and everything else.
+---
+---Markers come in **pairs**: the first opens a region, the second closes it. What is
+---between them is a case in its own right; what is outside every pair — the text
+---before the first marker, between one pair and the next, and after the last — is one
+---piece, concatenated in order. An unclosed pair is reported rather than guessed at.
+---@param text string?
+---@param char string
+---@return { marked: string[], rest: string }? blocks, integer markers
+local function partition(text, char)
+    local marked, rest, current = {}, {}, {}
+    local inside, markers = false, 0
+
+    for _, line in ipairs(vim.split(text or "", "\n", { plain = true })) do
+        if is_marker(line, char) then
+            markers = markers + 1
+            if inside then
+                marked[#marked + 1] = join(current)
+            else
+                vim.list_extend(rest, current)
+            end
+            current, inside = {}, not inside
+        else
+            current[#current + 1] = line
+        end
+    end
+    if inside then
+        return nil, markers -- a marker was opened and never closed
+    end
+    vim.list_extend(rest, current)
+    return { marked = marked, rest = join(rest) }, markers
+end
+
+---Lift the cases a testcase's markers bracket out into cases of their own.
+---
+---Deliberately **mechanical**: where a case ends is a property of the problem's input
+---format, not something that can be read off the text (`4` then four lines is a
+---multitest, but it is equally a 4x4 matrix), so the boundaries are the user's to
+---place and this only honours them. What is between a pair of markers becomes a
+---testcase exactly as written — nothing prepended, stripped or renumbered.
+---
+---Marking is by **pairs** rather than by single separators cutting the text into
+---parts, so nothing becomes a case without having been bracketed on both sides: the
+---text you did not mark is left as one piece, which is what makes it safe to reach for
+---mid-contest on a testcase you have not read closely.
+---@param input string?
+---@param expected string?
+---@param char string marker character
+---@return { rest: { input: string, output: string }, cases: { input: string, output: string }[] }?
+---@return string? err why it could not split
+function M.split_testcase(input, expected, char)
+    if type(char) ~= "string" or char == "" then
+        return nil, "no marker character given"
+    end
+    char = char:sub(1, 1)
+
+    local ins, in_markers = partition(input, char)
+    if in_markers == 0 then
+        return nil, "the input has no '" .. char .. "' marker lines"
+    end
+    if not ins then
+        return nil,
+            ("the input has %s, but markers come in pairs, one to open a case and one to close it"):format(
+                count(in_markers, "'" .. char .. "' marker line")
+            )
+    end
+    for _, case in ipairs(ins.marked) do
+        if case == "" then
+            return nil, "two markers with nothing between them mark an empty case"
+        end
+    end
+
+    -- The expected output is marked up the same way, and has to agree on how many
+    -- cases there are: pairing two lifted inputs with one answer would leave a case
+    -- judged on nothing and call it correct by accident.
+    local outs, out_markers = partition(expected, char)
+    if out_markers == 0 then
+        -- Only the input was marked up. If there are answers there, this is a slip
+        -- worth stopping for: the split rewrites the testcase, so going ahead would
+        -- leave every case unjudged *and* throw the answers away. Refusing costs one
+        -- more edit; the alternative silently destroys them.
+        if vim.trim(expected or "") ~= "" then
+            return nil,
+                ("the input marks %s but the expected output has no '%s' markers, so mark it up too or clear it"):format(
+                    count(#ins.marked, "case"),
+                    char
+                )
+        end
+        -- No answers to begin with: each case runs and shows its own output, which is
+        -- the useful half on its own.
+        local cases = {}
+        for i, text in ipairs(ins.marked) do
+            cases[i] = { input = text, output = "" }
+        end
+        return { rest = { input = ins.rest, output = "" }, cases = cases }
+    end
+    if not outs then
+        return nil,
+            ("the expected output has %s, but markers come in pairs"):format(count(out_markers, "'" .. char .. "' marker line"))
+    end
+    if #outs.marked ~= #ins.marked then
+        return nil,
+            ("the input marks %s but the expected output marks %d"):format(count(#ins.marked, "case"), #outs.marked)
+    end
+
+    local cases = {}
+    for i, text in ipairs(ins.marked) do
+        cases[i] = { input = text, output = outs.marked[i] }
+    end
+    return { rest = { input = ins.rest, output = outs.rest }, cases = cases }
+end
+
+---Split testcase `tcnum` of a buffer, writing the cases back through the backend.
+---
+---`tcnum` keeps the **rest** — the text outside the markers — so the testcase you
+---split stays the testcase it was, minus what you lifted out of it, and the cases take
+---the lowest free numbers. Renumbering the testcases *after* it would rename files of
+---cases the user never touched. Marking the whole testcase (a marker at each end)
+---leaves no rest, and then the first case takes `tcnum` rather than leaving an empty
+---testcase behind.
+---
+---`input`/`expected` override what is stored, for a caller holding text the user has
+---typed but not yet written — the runner UI, where the markers are put in by editing
+---the pane. The split writes every case, `tcnum` included, so that edit is committed
+---by the split itself rather than by a save that would first run the marked-up input
+---as if it were a testcase.
+---@param bufnr integer
+---@param tcnum integer
+---@param char string marker character
+---@param input string? text to split instead of the stored input
+---@param expected string? text to split instead of the stored expected output
+---@return integer[]? numbers every testcase number written, `tcnum` first
+---@return string? err
+---@return string? summary what happened, for the caller to report
+function M.buf_split_testcase(bufnr, tcnum, char, input, expected)
+    local tctbl = M.buf_get_testcases(bufnr)
+    local tc = tctbl[tcnum]
+    if not tc and input == nil then
+        return nil, "testcase " .. tostring(tcnum) .. " doesn't exist"
+    end
+    tc = tc or {}
+
+    local split, err = M.split_testcase(input or tc.input, expected or tc.output, char)
+    if not split then
+        return nil, err
+    end
+
+    local kept_rest = split.rest.input ~= "" or split.rest.output ~= ""
+    ---@type { input: string, output: string }[]
+    local write = {}
+    if kept_rest then
+        write[1] = split.rest
+        vim.list_extend(write, split.cases)
+    else
+        write = split.cases
+    end
+
+    local numbers = { tcnum }
+    local n = 0
+    for i = 2, #write do
+        while tctbl[n] or vim.tbl_contains(numbers, n) do
+            n = n + 1
+        end
+        numbers[i] = n
+    end
+    for i, case in ipairs(write) do
+        M.buf_save_testcase(bufnr, numbers[i], case.input, case.output)
+    end
+
+    local lifted = table.concat({ unpack(numbers, kept_rest and 2 or 1) }, ", ")
+    local summary
+    if kept_rest then
+        summary = ("testcase %d: lifted %s out into %s, and testcase %d keeps the rest"):format(
+            tcnum,
+            count(#split.cases, "case"),
+            (#split.cases == 1 and "testcase " or "testcases ") .. lifted,
+            tcnum
+        )
+    else
+        summary = ("testcase %d: everything was inside the markers, so it became %d testcases: %s"):format(
+            tcnum,
+            #split.cases,
+            lifted
+        )
+    end
+    return numbers, nil, summary
+end
+
+---The multitest count a testcase's input begins with, if it begins with one: a first
+---line holding a single non-negative integer and nothing else.
+---
+---That shape is the near-universal Codeforces convention (`t`, then `t` cases), and it
+---is the one thing the split leaves inconsistent — lifting a case out of a multitest
+---makes the count on the line above it wrong. It is only ever a *guess* that the number
+---means what it looks like, which is why it is offered rather than applied.
+---@param text string?
+---@return integer? count
+function M.leading_case_count(text)
+    local first = vim.split(text or "", "\n", { plain = true })[1]
+    local n = first and first:match("^%s*(%d+)%s*$")
+    return n and tonumber(n) or nil
+end
+
+---Make the counts agree again after a split: the kept testcase's first line becomes
+---`remaining`, and each lifted case gets a `1` of its own on top.
+---@param bufnr integer
+---@param numbers integer[] as returned by `buf_split_testcase`, the kept testcase first
+---@param remaining integer
+function M.apply_case_counts(bufnr, numbers, remaining)
+    local tctbl = M.buf_get_testcases(bufnr)
+    local kept = tctbl[numbers[1]]
+    if kept then
+        local lines = vim.split(kept.input or "", "\n", { plain = true })
+        lines[1] = tostring(remaining)
+        M.buf_save_testcase(bufnr, numbers[1], table.concat(lines, "\n"), kept.output)
+    end
+    for i = 2, #numbers do
+        local case = tctbl[numbers[i]]
+        if case then
+            M.buf_save_testcase(bufnr, numbers[i], "1\n" .. (case.input or ""), case.output)
+        end
+    end
+end
+
+---Offer to fix the counts up, when the testcase that was split looks like a multitest.
+---
+---Offered, not done: `3` on the first line is a case count in most Codeforces problems
+---and the first value of the only case in plenty of others, and nothing in the text
+---says which. So it is put in front of the user with the arithmetic spelled out, in the
+---same float every other tuna question uses — and dismissing it is "no", which is the
+---answer that changes nothing.
+---
+---Nothing is offered unless the *original* input began with a count. Reading it off the
+---kept testcase instead would fire on `-\nA\n-\n3\nB`, where the 3 was never a count
+---and only became the first line because the text above it was lifted out.
+---`on_settled` runs once the question is answered **either way** — accepted, declined,
+---or dismissed — and immediately when there is nothing to ask. It is what lets the
+---caller hold the run back until the testcases have stopped changing: running at split
+---time and again on acceptance would either judge the un-adjusted input or, with the
+---first run still in flight, leave the adjusted one unjudged.
+---@param bufnr integer
+---@param numbers integer[] as returned by `buf_split_testcase`
+---@param original_input string? the input as it was before the split
+---@param on_settled fun()? called once, after the answer
+function M.offer_case_counts(bufnr, numbers, original_input, on_settled)
+    on_settled = on_settled or function() end
+    local total = M.leading_case_count(original_input)
+    local lifted = #numbers - 1
+    -- Fewer cases claimed than were lifted out means the number is not a case count.
+    if not total or lifted < 1 or total < lifted then
+        on_settled()
+        return
+    end
+    local remaining = total - lifted
+
+    local answered = false
+    local function settle(accepted)
+        if answered then
+            return
+        end
+        answered = true
+        if accepted then
+            M.apply_case_counts(bufnr, numbers, remaining)
+            utils.notify(
+                ("testcase %d now starts with %d, and each lifted case starts with 1."):format(numbers[1], remaining),
+                "INFO"
+            )
+        end
+        on_settled()
+    end
+
+    require("tuna.ui.widgets").menu({
+        ("Yes: %d becomes %d here, and each new testcase starts with 1"):format(total, remaining),
+        "No, leave the numbers alone",
+    }, ("Testcase %d starts with '%d', is that a case count?"):format(numbers[1], total), function(idx)
+        settle(idx == 1)
+    end, vim.api.nvim_get_current_win(), function()
+        settle(false) -- dismissed: "no", the answer that changes nothing
+    end)
+end
+
+return M

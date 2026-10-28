@@ -1,0 +1,905 @@
+*tuna.txt*                              Competitive programming in Neovim
+                                                        *tuna* *tuna.nvim*
+
+               ██████████  ███    ███  ███     ███     ██████
+               ██████████  ███    ███  ████    ███    ███  ███
+                 ███      ███    ███  ███ ██  ███   ███    ███
+                 ███      ███    ███  ███  ██ ███  ████████████
+                ███      ██████████  ███   █████  ███      ███
+                ███       ████████   ███     ███  ███      ███
+
+tuna.nvim is a competitive programming plugin that integrates with Competitive
+Companion to download contests, runs your solution against testcases, supports
+stress testing, and much more. It is a ground-up rewrite of and successor to
+competitest.nvim, which is no longer maintained: a massive thank you to
+xeluxee and all the contributors to competitest.nvim for their great work.
+
+==============================================================================
+CONTENTS                                                       *tuna-contents*
+
+1. Requirements .......................................... |tuna-requirements|
+2. Installation .......................................... |tuna-installation|
+3. Quick start ............................................. |tuna-quickstart|
+4. Features .................................................. |tuna-features|
+      Testcases ............................................. |tuna-testcases|
+      Running and the runner UI ............................ |tuna-results-ui|
+      Run modes and scaffolding ............................. |tuna-run-modes|
+      Downloading and scratch ................................ |tuna-download|
+      Submitting ............................................... |tuna-submit|
+      Getting around ....................................... |tuna-navigation|
+      Cleaning .................................................. |tuna-clean|
+      Your algorithms library ................................. |tuna-library|
+      Keymaps ................................................. |tuna-keymaps|
+      Statusline ........................................... |tuna-statusline|
+5. Commands .................................................. |tuna-commands|
+6. Configuration ........................................ |tuna-configuration|
+      Where settings come from .......................... |tuna-config-layers|
+      Modifiers ............................................. |tuna-modifiers|
+      Keymaps .......................................... |tuna-config-keymaps|
+      Highlights ........................................... |tuna-highlights|
+      Submitting ......................................... |tuna-submit-setup|
+
+==============================================================================
+REQUIREMENTS                                               *tuna-requirements*
+
+- Neovim 0.10+
+- A compiler or interpreter for the languages you use
+- Optional: the Competitive Companion browser extension, to download problems
+  and contests: https://github.com/jmerle/competitive-companion
+- Optional: one or more command-line submit tools for your judges, such as
+  submitter, to submit your solutions and get the verdicts in your
+  statusline: https://github.com/EgorKulikov/submitter
+- Optional: toggleterm.nvim for the submit terminal, lualine.nvim for the
+  download and verdict indicators, which-key.nvim to see the keymaps as you
+  type them
+
+==============================================================================
+INSTALLATION                                               *tuna-installation*
+
+With lazy.nvim: >lua
+
+    { "FrancescoDerme/tuna.nvim" }
+<
+With vim.pack: >lua
+
+    vim.pack.add({ "https://github.com/FrancescoDerme/tuna.nvim" })
+<
+tuna works as soon as it is installed, and calling `setup()` is only needed to
+change its defaults (see |tuna-configuration|). It loads the rest of itself
+only when you use it, so there is no need to lazy-load it from your plugin
+manager.
+
+==============================================================================
+QUICK START                                                  *tuna-quickstart*
+
+1. `:Tuna` opens the menu.
+2. `:Tuna download problem` starts listening for a problem from Competitive
+   Companion: press the green plus in your browser to download it. A solution
+   file is created from your template, the testcases are written beside it,
+   and the file opens on the first line of `solve()`.
+3. `:Tuna run` compiles, runs the testcases in parallel, and opens the runner
+   UI. The four panes show output, expected output, input and stderr. This UI
+   can do a lot, for example `d` toggles a diff of the two outputs.
+4. `:Tuna submit` hands the solution to whichever submit tool you have
+   configured, reads that tool's output as it runs, and puts the judge's
+   verdict in your statusline.
+5. `:Tuna pin` and `:Tuna go` help you move between problems as you upsolve,
+   and `:Tuna clean` keeps your directories tidy.
+
+==============================================================================
+FEATURES                                                       *tuna-features*
+
+You can find a complete list of the commands in |tuna-commands|, along with a
+detailed explanation of how each one works. Here we aim to describe the most
+important features along with some basic workflows.
+
+------------------------------------------------------------------------------
+TESTCASES                                                     *tuna-testcases*
+
+Testcases live on disk beside your solution, as a pair of text files each by
+default.
+
+The file-name format in which testcases are written and discovered can be set
+in `testcases_input_file_format`, which accepts modifiers such as `$(FNOEXT)`
+and `$(TCNUM)`. It is a list of names: writing a testcase uses the first entry
+in the list, and discovering one tries the entries in order, the first that
+finds anything wins: >lua
+
+    testcases_input_file_format = {
+        "$(FNOEXT)_input$(TCNUM).txt", "input$(TCNUM).txt", "in.txt",
+    }
+<
+Where the testcases are stored can be set in `testcases_directory`: it's
+relative to the source by default, but can be an absolute path unrelated to
+the problem.
+
+Add, edit, and delete testcases with `:Tuna testcase add/edit/delete`.
+`:Tuna testcase generate` writes one from your generator, an input with no
+answer, to debug your solution on it. This can also be done in place in the
+runner UI, which is usually where you want to be.
+`:Tuna testcase split` breaks one testcase into several: mark the cases inside
+it with a line of `-`, and each bracketed region becomes a testcase of its
+own.
+
+------------------------------------------------------------------------------
+                                                              *tuna-runner-ui*
+RUNNING AND THE RUNNER UI                                    *tuna-results-ui*
+
+`:Tuna run` compiles (if necessary), runs every testcase in parallel (as many
+at once as you have cores, by default) and opens the runner UI. You can also
+open the runner UI by `:Tuna show_ui`.
+
+The whole grid is defined in `popup_ui.layout`, you can arrange it differently
+or move to `runner_ui.interface = "split"` for real windows instead of floats.
+
+Each testcase is a row, and the compile step is a row too that shows warnings
+and errors if there are any, customizable at `runner_ui.compile_layout`.
+
+The runner UI can do a lot, but it aims to stay intuitive by aligning to
+Neovim's defaults: the panes with a purple border are editable, and keys
+behave in them as in any buffer. From the read-only panes you can:
+
+- toggle the diff view with `d`,
+- rerun a testcase or all of them with `r` and `<C-r>`,
+- add, generate or delete a testcase with `n`, `t` and `x`,
+- and more.
+
+The key in each pane's title zooms it, and `<C-hjkl>` move you between panes,
+also customizable.
+
+Comparison between Output and Expected Output is driven by
+`output_compare_method`: `"exact"`, `"squish"` (whitespace-insensitive, the
+default), `{ "float", tol = 1e-6 }` for problems with a tolerance, or a method
+of your own in `compare_methods`. `:Tuna compare <method>` overrides it for
+one problem.
+
+------------------------------------------------------------------------------
+RUN MODES AND SCAFFOLDING                                     *tuna-run-modes*
+
+`:Tuna run` can do four different things based on helper programs discovered
+by filename beside your solution.
+
+    you write           `:Tuna run` becomes   what happens
+    ---------           -------------------   ------------
+    nothing             normal                run your solution against
+                                              every testcase
+    gen.* + brute.*     stress test           generate an input, run your
+                                              solution and the bruteforce,
+                                              compare the outputs, repeat
+                                              until they disagree and save
+                                              the counterexample
+    interactor.*        interactive           run your solution against
+                                              the interactor
+    checker.*           (any of the above)    a special judge decides
+                                              correctness instead of
+                                              string comparison
+
+Interactive mode is not tied to having an interactor present, in fact it has
+three sources that can provide the input: `live` (you), `interactor` (your
+interactor program) and `feed` (a stored testcase).
+
+A generator is useful on its own too: `:Tuna testcase generate` (`t` on the
+runner UI) writes a testcase from it, and `:Tuna run stress` without a
+bruteforce offers to search for an input your solution crashes or runs out of
+time on.
+
+Every helper is found the same way: a file named after it beside your solution
+(with the names in the table above or those specified in `tool_names`), or one
+of your own that you point to with its option (`checker`, `stress.generator`,
+`stress.bruteforce` or `interactive.interactor`), which can be specified in a
+`.tuna.lua` file beside the solution.
+
+The run mode, interactive's source and the checker are decided based on the
+helpers present until you force them: `:Tuna run <mode>` forces a mode,
+`:Tuna run interactive <source>` a source, `:Tuna checker off` plain
+comparison, and `auto` hands any of them back.
+
+`:Tuna scaffold solution/checker/generator/bruteforce/interactor` drops in a
+starter file:
+
+- a helper named as `tool_names` says, in your solution's language or in the
+  language configured at `scaffold.language` (for example, you may want to
+  have a `py` bruteforce even if you are coding in `cpp`),
+- a second solution beside yours, such as `main2.cpp` beside `main.cpp`.
+
+tuna ships `cpp` and `py` starters in its `scaffolds/` folder, and
+`scaffold.templates` points to your own (set to `tuna/scaffolds/<role>.<ext>`
+in your Neovim config by default), so you can customize a starter or add a new
+language by simply dropping a file there.
+
+Finally, when several solutions are present in one folder, `:Tuna run all`
+runs every one of them against the same testcases.
+
+------------------------------------------------------------------------------
+DOWNLOADING AND SCRATCH                                        *tuna-download*
+
+With Competitive Companion installed, `:Tuna download problem` (or `contest`,
+or `testcases`) opens a listener, and pressing the green plus in the browser
+does the rest. `:Tuna download persistently` leaves the listener open for a
+whole session.
+
+Where things land is decided by a path template, evaluated per problem: >lua
+
+    downloaded_problems_path =
+        "$(HOME)/cp/$(JUDGE)/$(PROBLEM)/main.$(FEXT)",
+    downloaded_contests_directory = "$(HOME)/cp/$(JUDGE)/$(CONTEST)",
+<
+`$(JUDGE)` and `$(CONTEST)` come from tuna's own parsing of what Competitive
+Companion sends, and you can override it per judge with `judge_parsers`.
+Codeforces and AtCoder are normalized out of the box, including Codeforces'
+mirror hosts: tuna rewrites the URL to the main site so links still work after
+the contest is over and keeps the mirror for submitting while the round is
+live.
+
+New solutions are created from the solution's template, with the problem's
+own details filled in for these placeholders: >cpp
+
+    // judge:   $(JUDGE)
+    // contest: $(CONTEST)
+    // problem: $(PROBLEM)
+    // submit at: $(URL)
+<
+The `scaffold.templates` option takes a path, a table by role, or an ordered
+list tried until one exists, which is what makes a per-judge template
+practical: >lua
+
+    scaffold = { templates = { solution = {
+        "~/cp/template.$(JUDGE).$(FEXT)", "~/cp/template.$(FEXT)",
+    } } },
+<
+A new solution opens where the `template_cursor` pattern matches your
+template (on the first line of a `solve` function by default), `false` turns
+this off.
+
+When entering a contest, some judges, like AtCoder, place you in the problems
+page, from which pressing the green plus is convenient. Others, like
+Codeforces, place you inside the first problem, so going to the problems page
+to download the contest at the start of the competition would lose precious
+seconds. To solve this, when dealing with judges of the second type, you can
+create a scratch file via `:Tuna scratch`. A scratch file also follows your
+template, and you can solve and submit the easiest problem of the contest in
+it (there are no testcases for tuna to run, and submitting won't work unless
+you add the problem's URL in a `// submit at:` header line, which defeats the
+purpose of being fast). After having solved this problem, you can download the
+rest of the contest with `:Tuna download sync`, which folds your scratch into
+the first problem's file.
+
+------------------------------------------------------------------------------
+SUBMITTING                                                       *tuna-submit*
+
+`:Tuna submit` hands the solution to a submit tool of your choosing and reads
+its output as it runs, so the judge's verdict arrives in your statusline: >lua
+
+    submit = {
+        command = 'cf submit "$(URL)" "$(LANG)" "$(FABSPATH)"',
+        languages = { cpp = "C++", python = "Python 3" },
+    },
+<
+A downloaded problem knows the correct URL to submit at (even without the
+header line), while a hand-made one becomes submittable the moment you add a
+`// submit at:` line with the correct URL into its header.
+
+`submit.judges.<judge>` overrides the submission tool per judge. The `browser`
+provider exists for judges for which you don't have a submission tool: it
+opens the submit page with the task preselected and puts your source on the
+clipboard.
+
+For a working setup of a submit tool see
+https://github.com/FrancescoDerme/dotfiles, in
+`nvim/.config/nvim/lua/plugins/tuna.lua`, where the submission tool is
+submitter (https://github.com/EgorKulikov/submitter).
+
+A step-by-step guide on setting this up, from pointing tuna at your tool to
+reading the verdict, is in |tuna-submit-setup|.
+
+------------------------------------------------------------------------------
+GETTING AROUND                                               *tuna-navigation*
+
+- `:Tuna next` / `:Tuna prev` step between the problems of a contest.
+  `:Tuna next scaffold` goes round the files of the problem you are on.
+- `:Tuna go problem` / `:Tuna go contest` move you back to what you were
+  working on. The menu also provides access to your recent contests and
+  problems.
+- `:Tuna pin` puts the problem you are on aside to solve later, and pinning it
+  again lets it go. The menu provides access to your pinned problems.
+
+------------------------------------------------------------------------------
+CLEANING                                                          *tuna-clean*
+
+`:Tuna clean` removes files you created and never used (or the ones you only
+slightly modified, with a tolerance the command asks for when you run it), and
+then the directories they leave empty. Every deletion is confirmed one at a
+time, with the file in front of you.
+
+------------------------------------------------------------------------------
+YOUR ALGORITHMS LIBRARY                                         *tuna-library*
+
+`:Tuna lib` copies a piece of your own library into the file you are writing.
+The library is plain source files in the folder `library.path` points at, with
+the parts worth copying marked in place, and notes about them right under the
+opening mark: >cpp
+
+    // TUNALIB: binary exp start
+    // b to the power e, modulo m
+    // Complexity: O(log e)
+    long long bexp(long long b, long long e, long long m) { ... }
+    // TUNALIB: binary exp end
+<
+It lists every snippet in files matching the current buffer's extension, and
+narrows the list as you type, matching a snippet's name, its file, its notes
+or a piece of its code. Beside the list are the highlighted snippet's notes,
+its complexity and its code, which you can step into and read before
+inserting it. Only the code is inserted. Since only the marked parts are
+copied, each library file can also be a program that tests its snippets
+against testcases, as `:Tuna lib` in |tuna-commands| explains.
+
+------------------------------------------------------------------------------
+KEYMAPS                                                         *tuna-keymaps*
+
+Keymaps make the tuna experience much better. You can opt in to the default
+keymaps with one line: `keymaps = { preset = "<leader>t" }` gives `<leader>tr`
+run, `<leader>tu` runner UI, `<leader>ts` submit, `<leader>tn`/`<leader>tp`
+problem navigation, `<leader>tdc` download a contest and `<leader>tds` sync,
+`<leader>tf` pin, `<leader>tl` the library, `<leader>tw` the scratch,
+`<leader>tm` the menu, and more. You can edit or drop any of them without
+giving up the rest, see |tuna-config-keymaps|.
+
+------------------------------------------------------------------------------
+STATUSLINE                                                   *tuna-statusline*
+
+Two optional lualine components can make for a better experience: the download
+listener indicator and the current problem's submit verdict.
+
+Every tuna window has the filetype `tuna`. Listing it in lualine's
+`ignore_focus` keeps the statusline describing the file underneath while a
+tuna window has focus. >lua
+
+    require("lualine").setup({
+        options = {
+            ignore_focus = { "tuna" },
+        },
+        sections = {
+            lualine_x = {
+                {
+                    function() return require("tuna").lualine_component() end,
+                    cond = function()
+                        local download = require("tuna.problem.download")
+                        return download.is_downloading()
+                    end,
+                },
+                {
+                    function()
+                        return require("tuna.problem.submit").status()
+                    end,
+                    cond = function()
+                        return require("tuna.problem.submit").is_submitting()
+                    end,
+                    color = function()
+                        return require("tuna.problem.submit").status_hl()
+                    end,
+                },
+            },
+        },
+    })
+<
+==============================================================================
+COMMANDS                                                       *tuna-commands*
+
+Every command is a subcommand of `:Tuna` with tab-completion, and a lowercase
+`:tuna` works too.
+
+                                                                       *:Tuna*
+:Tuna
+:Tuna menu
+        Open the menu. On the left are recent contests, recent problems and
+        pinned problems. On the right is what tuna can do from the file you
+        are on. `<CR>` acts on the list you are in, and `<C-hjkl>` (by
+        default) move between the lists.
+
+:Tuna run [auto/normal/all/stress/interactive] [n...]
+        Compile the solution, run the testcases in parallel (as many at once
+        as you have cores, by default) and open the runner UI.
+
+        In C and C++ the build is skipped when nothing it uses has changed
+        since the last build in this session: the solution, the compile
+        command, and the headers it includes that tuna can find (beside the
+        solution or in the compile command's `-I` directories). Any other
+        compiled language is built on every run, because its solution may be
+        made from files tuna can't see, such as a Rust module or a Java class
+        in a separate file.
+
+        Without a mode keyword tuna picks the mode itself: `interactive` when
+        an interactor sits beside the solution, `stress` when a generator and
+        a bruteforce do, `normal` otherwise. A keyword forces that mode for
+        the problem, and it is remembered across restarts until `auto` hands
+        the choice back to tuna.
+
+        - `normal` runs the testcases.
+        - `all` runs every solution in the folder against every testcase.
+        - `stress` hunts for an input where your solution and the bruteforce
+          disagree, and saves it as a testcase. A number after it is how many
+          inputs to try: `:Tuna run stress 500`. Each run tries new inputs,
+          and the runner UI shows the seed of the input being tried. Asked
+          for with no bruteforce, it offers to search without one: it keeps
+          an input your solution crashes on, runs out of time on or exits
+          with an error on, with no answer, and turns back into a stress run
+          once a bruteforce is there.
+        - `interactive` lets your solution talk to something over stdin and
+          stdout. A word after it picks the other side: `live` (you type),
+          `feed` (the testcase input, a line at a time) or `interactor` (an
+          interactor program).
+
+        In normal, interactive and run-all modes, trailing numbers run only
+        those testcases: `:Tuna run 2 3`, `:Tuna run all 2 3`. A problem that
+        runs as stress takes no testcase numbers because a number after
+        `:Tuna run stress` counts how many inputs to try.
+
+:Tuna show_ui
+        Open the runner UI in the mode the problem is set to.
+
+:Tuna testcase [add/edit/delete/generate] [n]
+        - `add` opens the testcase editor on a new testcase.
+        - `edit` opens it on testcase `n`. Bare `:Tuna testcase` and
+          `:Tuna testcase n` do the same.
+        - `delete` removes testcase `n`, after asking.
+        - `generate` writes a testcase from your generator, the same one that
+          stress uses. It has an input and no answer, so it reads `DONE`
+          unless your solution crashes, runs out of time or a checker judges
+          it. On the runner UI, `t` does the same.
+
+        Without a number, `edit` and `delete` act on the only testcase when
+        there is one, and ask which when there are several. The editor shows
+        the input and the expected output side by side: `:w` saves, `:wq`
+        saves and closes, and `q` closes, asking first about an edit not
+        saved.
+
+                                                         *tuna-testcase-split*
+:Tuna testcase split [n] [marker]
+        Break one testcase into several. Mark the cases inside it with a line
+        of the `testcases_split_markers` character (`-`, by default) or the
+        marker you type, in the input and the expected output alike. Markers
+        come in pairs: one opens a case, the next closes it, and what a pair
+        brackets becomes a testcase of its own. Everything outside every pair
+        stays in the testcase you split.
+
+        It refuses, leaving the testcase untouched, when a pair is left open,
+        when a pair brackets nothing, when the expected output brackets a
+        different number of cases, or when a non-empty expected output has no
+        markers at all. If the input starts with a case count, tuna then
+        offers to fix it.
+
+:Tuna convert {files/single_file/directory}
+        Rewrite the problem's testcases from one storage layout into another.
+        The layout they are in now is detected for you, and its files are
+        removed once the testcases are rewritten.
+
+        The storage backends, chosen with `testcases_storage`:
+
+            files (default)   `main_input0.txt` / `main_output0.txt`
+                              beside the source
+            single_file       every testcase in one msgpack file,
+                              `main.testcases`
+            directory         one sub-directory per testcase,
+                              `tests/0/input.txt` + `output.txt`
+
+:Tuna compare [exact/squish/float [tol]/name]
+        Set how the output is compared with the expected output, for this
+        problem only. It is remembered across restarts.
+
+        - `exact` compares character for character.
+        - `squish` ignores how the output is spaced: runs of whitespace and
+          line breaks count as one space, and leading and trailing whitespace
+          is dropped.
+        - `float` compares token by token, accepting numbers within an
+          absolute or relative error of `tol` (`1e-6` when not given), as
+          judges do.
+        - `name` is a method of your own, defined under that name in
+          `compare_methods`.
+
+        Without an argument it changes nothing and says which method is in
+        use.
+
+:Tuna checker [auto/off]
+        - `auto`, the default, judges with the problem's checker when there is
+          one: a `checker.*` file beside the solution, or the `checker` option
+          in a `.tuna.lua` above the solution. It runs as
+          `checker <input> <output> <answer>`, testlib's order, and exit code
+          0 means correct. If a checker isn't set, it falls back to the
+          compare option.
+        - `off` ignores the checker and compares the outputs with the compare
+          option.
+
+        The choice is remembered for the problem. Without an argument it
+        changes nothing and says which of the two is set, and which checker is
+        found.
+
+:Tuna download {testcases/problem/contest/sync/persistently/status/stop}
+        Open a listener for Competitive Companion. Press the green plus in
+        your browser and tuna does the rest.
+
+        - `problem` writes a solution file from your template and its
+          testcases.
+        - `contest` does the same for every problem of a contest, each in its
+          own place.
+        - `testcases` adds only the testcases, to the solution you are in.
+        - `sync` downloads like `contest`, or like `problem` when
+          `scratch.download` says so, and folds your `:Tuna scratch` file into
+          the first problem it writes.
+        - `persistently` keeps the listener open for the whole session.
+        - `status` says whether the listener is open, and `stop` closes it.
+
+        Where everything lands is set by `downloaded_problems_path` and
+        `downloaded_contests_directory`. A problem that already exists is
+        asked about before it's overwritten, and a contest asks once for the
+        whole batch, offering to write only the problems that are missing.
+
+                                                               *tuna-scaffold*
+:Tuna scaffold {solution/checker/generator/bruteforce/interactor} [ext]
+        Drop a starter beside the solution and open it. A helper program is
+        named so that a run finds it, in the language `ext` names, else in
+        `scaffold.language`, else in your solution's. A solution is named by
+        you, but tuna offers the next free name (`main2.cpp` beside
+        `main.cpp`), in the language `ext` names, else, if the folder already
+        has a solution, in that solution's language, else in
+        `downloaded_files_extension`. Every starter, a downloaded solution
+        included, comes from the first file `scaffold.templates` names that
+        exists, else from tuna's own `cpp` and `py` starters, so replacing a
+        starter or adding a language is done by dropping a file at one of the
+        `scaffold.templates` paths. The modifiers in a template are filled
+        in, and without a problem to fill them from (no download, no
+        `.tuna.json` beside it) the header lines with a problem's modifier
+        are left out.
+
+:Tuna submit [clear]
+        Hand the solution to the submit tool you configured, read its output
+        as it runs, and put the judge's verdict in your statusline. `clear`
+        dismisses the verdict, and cancels a submission still being watched.
+        Setting it up is described in |tuna-submit-setup|.
+
+:Tuna next [problem/scaffold]
+:Tuna prev [problem/scaffold]
+        `:Tuna next problem` and `:Tuna prev problem` open the problem either
+        side of this one in its contest, preferring the file name you are
+        leaving (`A/main.cpp` to `B/main.cpp`). If Neovim's directory is the
+        problem you are leaving, or a folder inside it, it moves to the new
+        problem with you. From the contest's folder, or anywhere else, it
+        stays. At either end of the contest they say so rather than wrapping
+        around.
+
+        `:Tuna next scaffold` and `:Tuna prev scaffold` go round the source
+        files of the problem you are on instead, in name order, wrapping
+        around.
+
+        Bare `:Tuna next` and `:Tuna prev` mean the problem.
+
+:Tuna go [problem/contest]
+        Go back to the problem, or the contest, you were last working on,
+        across restarts, and move Neovim's directory there with you. Bare
+        `:Tuna go` means the problem.
+
+                                                                 *tuna-pinned*
+:Tuna pin
+        Put the problem you are on aside to solve later, and running it again
+        undoes the pin. Pinned problems wait in the menu, most recently pinned
+        first. A pin stays until you unpin it or delete the solution.
+
+:Tuna scratch
+        Open a scratch solution for when downloading a contest's first problem
+        is slow, asking which of your templates to start from. If a scratch
+        already exists tuna asks whether to resume it or restart.
+        `:Tuna download sync` then folds what you wrote into the first problem
+        it downloads.
+
+:Tuna lib
+        Copy a piece of your own library into the file you are writing. The
+        library is plain source files under `library.path`, with the parts
+        worth copying marked in place, and notes about them right under the
+        opening mark, see |tuna-library|.
+
+        It lists every snippet in files with the current file's extension. If
+        a file has no marked snippet, it is offered whole. A snippet's notes
+        are the comment lines right under its opening mark, up to the first
+        blank or code line. From a line starting with `Complexity:` to their
+        end, they are treated as the snippet's complexity. Typing narrows the
+        list: name and file name matches show up first, then the snippets
+        whose notes are matched, and then those whose code is. Beside the
+        list are the snippet's notes, its complexity and its code, each in a
+        pane of its own. While you type in the search box, `<Down>` and
+        `<Up>` move the highlight through the list, `<CR>` inserts the
+        highlighted snippet, and the pane keys (`switch_window_keys`) move
+        between the list and the panes beside it. Only the code is inserted,
+        re-indented to where the cursor is.
+
+        Since only the marked parts are copied, a library file can be a whole
+        program whose `main` exercises its snippets, tested with `:Tuna run`
+        against testcases like any problem. A `.tuna.lua` in the library
+        folder can keep every file's testcases in one shared folder, with
+        `testcases_directory = "tests"`, and listing the library in
+        `recent.ignored_directories` keeps its files out of your recent
+        problems.
+
+:Tuna clean
+        Remove files you created and never used, such as unchanged template
+        solutions and scaffolds, and then the directories they leave empty.
+        It also offers the binaries of sources you deleted manually, while
+        deleting a source through the command automatically deletes its
+        binary. You choose where to look, how deep, and how close to its
+        template a file must still be. Every deletion is confirmed one at a
+        time, with the file in front of you.
+
+                                             *tuna-health* *:checkhealth-tuna*
+:checkhealth tuna
+        Report what tuna can see: your Neovim version, whether each configured
+        compiler and interpreter is on `PATH`, the Competitive Companion port,
+        your submit setup and the optional plugins.
+
+==============================================================================
+CONFIGURATION                                             *tuna-configuration*
+
+Everything is optional: `setup()` takes a table shaped like the defaults, and
+anything you leave out keeps its default. With lazy.nvim, the same table can
+go in the spec's `opts`. >lua
+
+    require("tuna").setup({
+        compile_command = {
+            cpp = { exec = "g++", args = {
+                "-std=c++20", "-O2", "-Wall", "$(FNAME)", "-o", "$(FNOEXT)",
+            } },
+        },
+        maximum_time = 3000,
+        scaffold = { templates = { solution = {
+            "~/cp/template.$(JUDGE).$(FEXT)", "~/cp/template.$(FEXT)",
+        } } },
+        downloaded_problems_path =
+            "$(HOME)/cp/$(JUDGE)/$(PROBLEM)/main.$(FEXT)",
+        keymaps = { preset = "<leader>t" },
+    })
+<
+An example of a complete configuration is in
+https://github.com/FrancescoDerme/dotfiles, in
+`nvim/.config/nvim/lua/plugins/tuna.lua`.
+
+------------------------------------------------------------------------------
+WHERE SETTINGS COME FROM                                  *tuna-config-layers*
+
+Settings come from three layers, each overriding the one before:
+
+1. the defaults;
+2. what you pass to `setup()`, if you call it;
+3. a `.tuna.lua` anywhere above the file you are editing, returning a table.
+   This way a contest folder can set a different time limit, template or
+   testcase layout for everything under it without touching your config. It is
+   read again whenever its text changes, so a saved edit applies to the next
+   run, with no restart.
+
+Every option, with its default and what it does, is commented in tuna's
+`lua/tuna/config.lua`. The sections below cover some details.
+
+------------------------------------------------------------------------------
+MODIFIERS                                                     *tuna-modifiers*
+
+Modifiers are the `$(...)` placeholders that appear in commands, file formats,
+paths and templates. There are two sets, and which one applies depends on
+whether a downloaded problem is involved.
+
+File modifiers: available anywhere a path or command is evaluated.
+
+    $(FNAME)            main.cpp
+    $(FNOEXT)           main
+    $(FEXT)             cpp
+    $(FABSPATH)         /home/you/cp/A/main.cpp
+    $(ABSDIR)           /home/you/cp/A
+    $(DIRNAME)          A, the name of the directory, which for a downloaded
+                        problem is the problem's name
+    $(HOME) $(CWD)      your home and current directories
+    $(TCNUM)            the testcase number (testcase file formats only)
+    $(ROLE)             the role a template is for, `solution`, `checker`,
+                        `generator`, `bruteforce` or `interactor`
+                        (`scaffold.templates` only)
+    $()                 a literal `$`
+
+Download modifiers: additionally available in `downloaded_*` paths and in
+templates, because they only exist for a downloaded problem.
+
+    $(PROBLEM)              the problem's name
+    $(JUDGE) $(CONTEST)     problem's judge and contest, as parsed from what
+                            the extension sent (see `judge_parsers`)
+    $(GROUP)                the judge and contest, e.g.
+                            `Codeforces - Codeforces Round 1000 (Div. 2)`,
+                            which `$(JUDGE)` and `$(CONTEST)` are parsed from
+    $(URL)                  the problem's address
+    $(TIMELIM) $(MEMLIM)    the judge's limits, in ms and MB
+    $(JAVA_MAIN_CLASS)      for Java solution templates
+    $(JAVA_TASK_CLASS)
+    $(DATE)                 now, formatted with `date_format`
+
+Characters that cannot appear in a filename are replaced with `_` in every
+modifier that becomes part of a path. A leading `~` is expanded in every
+option that holds a path.
+
+------------------------------------------------------------------------------
+KEYMAPS                                                  *tuna-config-keymaps*
+
+Nothing is mapped unless you ask. The preset maps some useful actions under
+one prefix: >lua
+
+    keymaps = {
+        preset = "<leader>t",
+    },
+<
+    In a solution
+    `<leader>tr`                   run
+    `<leader>tu`                   show the runner UI
+    `<leader>ts`                   submit
+    `<leader>tn`, `tp`             next, previous problem
+    `<leader>tf`                   pin
+    `<leader>tl`                   library
+    `<leader>tdt`                  download testcases
+
+    Everywhere
+    `<leader>tm`                   menu
+    `<leader>tw`                   scratch
+    `<leader>tdp`, `tdc`, `tds`    download a problem, a contest, sync
+    `<leader>tgp`, `tgc`           back to the last problem, contest
+
+The preset groups keys by subject: `d` for downloads and `g` for "go to". A
+key inside a group has a short label that leaves out the group's word
+(`<leader>tdp` is `Problem`), so if you use which-key, name the groups in your
+config: >lua
+
+    require("which-key").add({
+        { "<leader>t", group = "Tuna" },
+        { "<leader>td", group = "Download" },
+        { "<leader>tg", group = "Go to" },
+    })
+<
+Your own keys layer over the preset rather than replacing it, so one can be
+moved, or dropped by mapping its action to `false`, without giving up the
+rest: >lua
+
+    keymaps = {
+        preset = "<leader>t",
+        mappings = { run = "<leader><leader>", pin = false },
+    },
+<
+`mappings` are buffer-local, set for the solution filetypes in
+`keymaps.filetypes`, and `global` are set once and always there.
+
+Every action can be mapped this way. An action is a name for a `:Tuna` command
+with its arguments fixed. Actions are defined in `M.actions` in
+`lua/tuna/keymaps.lua`: `menu`, `run`, `run_all`, `run_stress`,
+`run_interactive`, `show_ui`, `add_testcase`, `edit_testcase`,
+`delete_testcase`, `generate_testcase`, `submit`, `submit_clear`,
+`download_testcases`, `download_problem`, `download_contest`, `download_sync`,
+`clean`, `pin`, `next_problem`, `prev_problem`, `next_scaffold`,
+`prev_scaffold`, `go_problem`, `go_contest`, `scratch` and `library`.
+
+------------------------------------------------------------------------------
+HIGHLIGHTS                                                   *tuna-highlights*
+
+tuna colours its windows with these highlight groups:
+
+- `TunaCorrect`, `TunaWrong`, `TunaWarning`, `TunaRunning` and `TunaDone`: the
+  verdicts.
+- `TunaEditable`: the border of the panes you can type into.
+- `TunaMenuTitle`: the letters of the menu's banner.
+- `TunaDiffText`, `TunaDiffAdd` and `TunaDiffDelete`: the diff view.
+
+tuna's colours are only defaults: define any of these groups yourself, or in
+your colorscheme, and yours win. tuna sets its defaults again after every
+colorscheme change, so the groups you leave alone follow your theme.
+
+------------------------------------------------------------------------------
+SUBMITTING                                                 *tuna-submit-setup*
+
+tuna does not talk to judges itself, so `:Tuna submit` drives whichever
+command-line submitter you already use.
+
+1. Point it at your tool >lua
+
+    require("tuna").setup({
+        submit = {
+            command = 'cf submit "$(URL)" "$(LANG)" "$(FABSPATH)"',
+            languages = { cpp = "C++", python = "Python 3", java = "Java" },
+        },
+    })
+<
+`command` is expanded with the file modifiers plus three of its own:
+
+- `$(URL)`: what to submit through.
+- `$(PROBLEM_URL)`: the problem's address.
+- `$(LANG)`: `submit.languages[filetype]`, the name your tool uses for the
+  language.
+
+The two URLs exist separately because the address that identifies a problem is
+not always the one you submit through. Use `$(URL)` unless your tool needs the
+problem page.
+
+2. Make sure it knows which problem
+
+The URL is resolved in three steps, first hit wins:
+
+  1. `submit.url` as a function `(ctx) -> string`, if you set one.
+  2. The header marker: a Lua pattern scanned over the first `url_scan_lines`
+     (10, by default) lines of the file. The default is
+     `"submit at:%s*(%S+)"`, which matches a header line like this one,
+     written by hand or by a template carrying `// submit at: $(URL)`: >cpp
+
+    // submit at: https://codeforces.com/contest/2250/problem/A
+<
+  3. The sidecar (`.tuna.json`) the download wrote beside the file.
+
+So a downloaded problem is submittable with no markers at all, and a hand-made
+one becomes submittable the moment you paste its URL into the header.
+Whichever way it resolves, the first submit records the URL in the sidecar, so
+a problem you set up by hand behaves like a downloaded one from then on.
+
+A URL that still contains an unexpanded `$(...)` is rejected rather than
+handed to the tool, which stops `:Tuna submit` on a raw template.
+
+3. Decide how the verdict comes back
+
+By default tuna runs the tool as a background job and reads its output
+(`submit.watch = true`). `submit.verdicts` is an ordered list of
+`{ lua_pattern, state }` rules matched against that output, most tools need no
+changes: >lua
+
+    verdicts = {
+        { "queued", "pending" }, { "testing", "pending" },
+        { "compiling", "pending" }, { "accepted", "accepted" },
+        { "wrong answer", "rejected" }, { "time limit", "rejected" },
+        -- …
+    },
+<
+`pending` keeps watching, while `accepted`, `rejected` and `partial` are final
+and stop watching.
+
+If your tool prints nothing tuna recognises then nothing is claimed: a clean
+exit clears the indicator, and a non-zero exit is reported as a failure with
+the tool's own error line and its credentials blanked out.
+
+Two cases want the other path, `submit.watch = false`, which runs the tool in
+a terminal:
+
+- your tool asks you something;
+- you would rather read what the tool prints as it runs.
+
+`open_terminal` then decides whether the terminal opens in front of you, or
+runs in the background for you to open when you want.
+
+4. Different judges, different tools
+
+`submit.judges.<judge>` is folded over everything above, keyed on the URL's
+host: >lua
+
+    submit = {
+        command = 'cf submit "$(URL)" "$(LANG)" "$(FABSPATH)"',
+        judges = {
+            kattis  = { command = "kattis $(FNAME)", watch = false },
+            atcoder = { provider = "browser" },
+        },
+    },
+<
+The `browser` provider is for a judge you cannot submit to headlessly at all,
+because you don't have a tool for it. It opens the submit page with the task
+preselected and puts your source on the system clipboard.
+
+5. Read the verdict
+
+With lualine configured (see |tuna-statusline|), the verdict sits in your
+statusline, coloured by `submit.verdict_highlight`. It is per problem, lasts
+until you submit that problem again, survives a restart, and disappears the
+moment you edit the solution. `:Tuna submit clear` dismisses it, and cancels a
+submission still being watched.
+
+If something goes wrong, `submit.log_file` records each submission's raw
+output and the verdict tuna parsed from it, which is useful to work out which
+pattern your tool needs.
+
+Every submit option                                      *tuna-submit-options*
+
+Every submit option lives under `submit`, and `submit.judges` overrides them
+per judge. Each one, with its default and what it does, is commented in the
+`submit` block of tuna's `lua/tuna/config.lua`.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

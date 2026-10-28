@@ -1,0 +1,113 @@
+-- lua/tuna/runner_ui/layout.lua
+--
+-- What the two interface modules (`popup`, `split`) agree on: the set of panes
+-- that exist, their titles, and what makes a `{ ratio, child }` layout usable.
+--
+-- A layout names the panes it wants. Leaving one out is a legitimate choice — not
+-- everyone wants the Errors pane taking a quarter of the screen — so an omitted
+-- pane must simply not be drawn, never break the grid around it. The pane's
+-- *buffer* still exists either way, so its content is kept
+-- and can still be zoomed; only the window is skipped.
+--
+-- `tc` is the one exception: the selector is where the cursor lives and where the
+-- keymaps are bound, so a layout without it isn't a layout. `st` is not placed
+-- either — it is carved out of `tc`'s rectangle by the interface.
+
+local utils = require("tuna.utils")
+
+local M = {}
+
+---Every pane the UI knows, and the title on its border.
+M.titles = {
+    st = " Run ",
+    tc = " Testcases ",
+    so = " Output ",
+    eo = " Expected Output ",
+    si = " Input ",
+    se = " Errors ",
+}
+
+---What a grid may place, by what it is for. A testcase row's grid is written in the panes'
+---own names, each naming the content it shows. The build step's is written as `tc` and one
+---`build` cell, which the UI splits into a pane per source it compiles: those are the detail
+---panes' buffers underneath, but what they hold there is a compiler's output rather than a
+---stdout or a stdin, so the names that say those things have no place in its grid. `st` is
+---derived from `tc`, so it is never placed.
+---@type table<string, { placeable: table<string, boolean>, required: string[] }>
+M.kinds = {
+    run = { placeable = { tc = true, so = true, eo = true, si = true, se = true }, required = { "tc" } },
+    build = { placeable = { tc = true, build = true }, required = { "tc", "build" } },
+}
+
+-- Why a grid without one of the names it needs is refused.
+local MISSING = {
+    tc = "no 'tc' pane, the testcase selector cannot be left out",
+    build = "no 'build' cell, the build step would have nowhere to show what its compilers said",
+}
+
+---@private
+---Collect a layout's leaf names in order, or report the first structural problem.
+---@param layout any
+---@param acc string[]
+---@param placeable table<string, boolean> the names this kind of grid may place
+---@return string[]? leaves, string? err
+local function collect(layout, acc, placeable)
+    if type(layout) == "string" then
+        if not placeable[layout] then
+            return nil, ("unknown pane '%s'"):format(layout)
+        end
+        if vim.tbl_contains(acc, layout) then
+            return nil, ("pane '%s' appears twice"):format(layout)
+        end
+        acc[#acc + 1] = layout
+        return acc
+    end
+    if type(layout) ~= "table" or #layout == 0 then
+        return nil, "expected a list of { ratio, pane-or-layout } pairs"
+    end
+    for _, entry in ipairs(layout) do
+        if type(entry) ~= "table" or type(entry[1]) ~= "number" or entry[2] == nil then
+            return nil, "expected a list of { ratio, pane-or-layout } pairs"
+        end
+        local ok, err = collect(entry[2], acc, placeable)
+        if not ok then
+            return nil, err
+        end
+    end
+    return acc
+end
+
+---Validate a layout. One that can't be used is reported and replaced by the shipped default
+---for that option, so a typo costs the user their arrangement, not their runner UI.
+---@param layout table the configured layout
+---@param option string the option's name, for the warning (e.g. "popup_ui.layout")
+---@param fallback table the default layout for that option
+---@param kind "run"|"build"? what the grid is for (default a testcase row's, `run`)
+---@return table layout the layout to lay out
+function M.resolve(layout, option, fallback, kind)
+    local spec = M.kinds[kind or "run"]
+    -- The top level is always a list, even for a single pane (`{ { 1, "tc" } }`):
+    -- the split interface descends by index, so a bare name there has nothing to
+    -- descend into.
+    local leaves, err
+    if type(layout) ~= "table" then
+        err = "expected a list of { ratio, pane-or-layout } pairs"
+    else
+        leaves, err = collect(layout, {}, spec.placeable)
+    end
+    if leaves then
+        for _, name in ipairs(spec.required) do
+            if not vim.tbl_contains(leaves, name) then
+                err = MISSING[name]
+                break
+            end
+        end
+    end
+    if err then
+        utils.notify(("%s: %s, using the default layout."):format(option, err), "WARN")
+        return fallback
+    end
+    return layout
+end
+
+return M

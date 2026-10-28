@@ -1,0 +1,1367 @@
+-- lua/tuna/workspace/clean.lua
+--
+-- `:Tuna clean` — remove files that were created but never used: solution files
+-- and scaffolding (checker/gen/brute/interactor) that still hold nothing but the
+-- template they were generated from, and builds whose source is gone. Because such files are *templated* they are
+-- not empty, so "unused" can't be detected by emptiness — instead a file counts
+-- as unused when its content still matches the template that would produce it
+-- (each `$(...)` modifier is treated as a wildcard, so a filled-in header still
+-- matches). An empty file is always unused.
+--
+-- Removing files empties directories, so a run finishes by offering those too: any
+-- directory left holding nothing but testcases and sidecars is proposed for deletion,
+-- deepest first, so a whole tree can collapse in one pass (problems, then the contest
+-- holding them, then the directory holding the contests). Places the user works in —
+-- the scanned root, the cwd, the directory the command was launched from and the roots
+-- configured in `setup()` — are never proposed.
+--
+-- The whole flow uses tuna's floating widgets (never command-line prompts): one form
+-- picks the directory (prefilled with the directories from `setup()`), the recursion
+-- depth and the match threshold together — each list ending in a row that is edited
+-- in place, so several of them can be customized in a single pass — then one
+-- confirmation menu per candidate file, and one per candidate directory.
+
+local api = vim.api
+local config = require("tuna.config")
+local utils = require("tuna.utils")
+local widgets = require("tuna.ui.widgets")
+
+local M = {}
+
+-- Config language name -> the file extension solutions of that language use, so a
+-- directory scan only reads files that could plausibly be a solution/scaffold.
+local LANG_EXT = { c = "c", cpp = "cpp", python = "py", java = "java", rust = "rs" }
+
+--------------------------------------------------------------------------------
+-- Template matching
+--------------------------------------------------------------------------------
+
+---Escape Lua-pattern magic characters in a literal string.
+---@param s string
+---@return string
+local function escape(s)
+    return (s:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0"))
+end
+
+---Turn a single template line into an anchored Lua pattern: literal text is matched
+---verbatim, each `$(...)` modifier becomes a `.-` wildcard (so whatever it expanded
+---to — a problem name, a date, or the literal `$(...)` when unevaluated — matches).
+---@param tline string
+---@return string
+local function line_to_pattern(tline)
+    local parts, i = {}, 1
+    while true do
+        local s, e = tline:find("%$%b()", i)
+        if not s then
+            parts[#parts + 1] = escape(tline:sub(i))
+            break
+        end
+        parts[#parts + 1] = escape(tline:sub(i, s - 1))
+        parts[#parts + 1] = ".-"
+        i = e + 1
+    end
+    return "^" .. table.concat(parts) .. "$"
+end
+
+---A predicate that tests whether a file line matches a template line. Lines without
+---a `$(...)` compare by exact equality (fast path); lines with one become a pattern.
+---@param tline string
+---@return fun(fline: string): boolean
+local function line_matcher(tline)
+    if tline:find("%$%b()") then
+        local pat = line_to_pattern(tline)
+        return function(fline)
+            return fline:match(pat) ~= nil
+        end
+    end
+    return function(fline)
+        return fline == tline
+    end
+end
+
+---Similarity of `content` to `tmpl` in `[0,1]`: the length of the longest common
+---subsequence of lines (a file line "matches" a template line via `line_matcher`,
+---so `$(...)` regions stay wildcards) over the longer of the two, so both edits and
+---additions lower the score. An untouched file scores 1.0; heavier edits score less.
+---Leading/trailing blank lines are ignored.
+---@param content string
+---@param tmpl string
+---@param min_ratio number? skip the comparison when this score is already unreachable
+---@return number
+local function similarity(content, tmpl, min_ratio)
+    local tlines = vim.split(vim.trim(tmpl), "\n", { plain = true })
+    local flines = vim.split(vim.trim(content), "\n", { plain = true })
+    local n, m = #tlines, #flines
+    if n == 0 then
+        return m == 0 and 1 or 0
+    end
+    -- The LCS can never exceed the shorter file, so the score can never exceed
+    -- min(n,m)/max(n,m). When that ceiling is already under the threshold the file
+    -- cannot qualify however it is compared — decided on line counts alone, which is
+    -- what keeps a scan over many unrelated files from paying for the DP at all.
+    if min_ratio and math.min(n, m) / math.max(n, m) < min_ratio then
+        return 0
+    end
+    -- Guard the O(n*m) DP against a pathologically large file.
+    if n * m > 4000000 then
+        return content == tmpl and 1 or 0
+    end
+    local matchers = {}
+    for i, t in ipairs(tlines) do
+        matchers[i] = line_matcher(t)
+    end
+    local prev = {}
+    for j = 0, m do
+        prev[j] = 0
+    end
+    for i = 1, n do
+        local cur = { [0] = 0 }
+        local mt = matchers[i]
+        for j = 1, m do
+            if mt(flines[j]) then
+                cur[j] = prev[j - 1] + 1
+            else
+                cur[j] = math.max(prev[j], cur[j - 1])
+            end
+        end
+        prev = cur
+    end
+    return prev[m] / math.max(n, m)
+end
+
+--------------------------------------------------------------------------------
+-- Classification
+--------------------------------------------------------------------------------
+
+---Map a base filename (no extension) to the helper role it names, from `tool_names`: the
+---names discovery finds a helper by are the names a scaffold is written under.
+---@param cfg table
+---@return table<string, string>
+local function tool_roles(cfg)
+    local map = {}
+    for _, role in ipairs(require("tuna.run.tools").ROLES) do
+        for _, name in ipairs(cfg.tool_names[role] or {}) do
+            map[name] = role
+        end
+    end
+    return map
+end
+
+---The file extensions worth reading during a scan.
+---@param cfg table
+---@return table<string, boolean>
+local function source_exts(cfg)
+    local exts = { cpp = true, py = true } -- scaffold built-ins always relevant
+    for _, group in ipairs({ cfg.compile_command, cfg.run_command }) do
+        for lang in pairs(group or {}) do
+            if LANG_EXT[lang] then
+                exts[LANG_EXT[lang]] = true
+            end
+        end
+    end
+    if cfg.downloaded_files_extension then
+        exts[cfg.downloaded_files_extension] = true
+    end
+    return exts
+end
+
+---The templates a file at `full` of `role` could have been written from, read once per scan.
+---Every one is compared, since which a file came from is recorded nowhere: a fallback list
+---means more than one may apply. Nil when the file is one of them, since a template would
+---match itself and is never offered.
+---@param full string
+---@param ext string
+---@param role string
+---@param cfg table
+---@param cache table<string, any> per-scan memo
+---@return string[]?
+local function templates_of(full, ext, role, cfg, cache)
+    cache["\0glob"] = cache["\0glob"] or {}
+    local itself = vim.fs.normalize(full)
+    local out = {}
+    for _, path in ipairs(require("tuna.workspace.scaffold").templates(role, cfg, full, ext, cache["\0glob"])) do
+        if vim.fs.normalize(path) == itself then
+            return nil
+        end
+        if cache[path] == nil then
+            cache[path] = utils.read_file(path) or false
+        end
+        if cache[path] then
+            out[#out + 1] = cache[path]
+        end
+    end
+    return out
+end
+
+---Classify a file: return a human-readable "unused" reason, or nil if it looks
+---used. A file is unused when its similarity to the template that would produce it
+---is at least `threshold` (1.0 = an exact/untouched match; 0.95 = "95% the template",
+---so a lightly-edited file still counts). An empty file is always unused.
+---@param full string
+---@param ext string
+---@param base string basename without extension
+---@param roles table<string, string> helper role by base name (`tool_roles`)
+---@param cfg table
+---@param threshold number similarity in [0,1] at/above which a file counts as unused
+---@param cache table<string, any> per-scan memo (templates, keyed by path/role)
+---@return string? reason, number? similarity the score the reason quotes, for ranking
+local function classify(full, ext, base, roles, cfg, threshold, cache)
+    -- A file generated from a template is small. Anything enormous is certainly not
+    -- one, and reading it is exactly the cost worth avoiding on a big scan.
+    local stat = vim.uv.fs_stat(full)
+    if stat and stat.size > 1048576 then
+        return nil
+    end
+    local content = utils.read_file(full)
+    if content == nil then
+        return nil
+    end
+    local role = roles[base] or "solution"
+    local tmpls = templates_of(full, ext, role, cfg, cache)
+    if not tmpls then
+        return nil
+    end
+    -- Nothing was ever written to it, so it ranks with the surest deletions (1.0).
+    if vim.trim(content) == "" then
+        return "empty file", 1
+    end
+    -- A file written from one template matches that one and no other, so the best match
+    -- picks it out.
+    local best = 0
+    for _, tmpl in ipairs(tmpls) do
+        best = math.max(best, similarity(content, tmpl, threshold))
+    end
+    if best >= threshold then
+        local what = role == "solution" and "solution template" or (role .. " scaffold")
+        return ("%d%% match to %s"):format(math.floor(best * 100 + 0.5), what), best
+    end
+    return nil
+end
+
+--------------------------------------------------------------------------------
+-- Directory discovery + scanning
+--------------------------------------------------------------------------------
+
+---The base directory a configured path option points into: expand the leading
+---context modifiers (`~`, `$(HOME)`, `$(CWD)`), then cut at the first remaining
+---`$(...)` (a per-problem modifier like `$(JUDGE)`/`$(PROBLEM)`) and take the
+---directory part. E.g. `$(HOME)/cp/problems/$(JUDGE)/…` -> `~/cp/problems`,
+---`~/cp/template.$(FEXT)` -> `~/cp`.
+---@param path_str any
+---@return string?
+local function base_dir_of(path_str)
+    if type(path_str) ~= "string" or path_str == "" then
+        return nil
+    end
+    local home, cwd = vim.uv.os_homedir() or "", vim.fn.getcwd()
+    -- Replaced through functions, so a `%` in either path is not read as a capture.
+    local s = utils.expand_home(path_str)
+        :gsub("%$%(HOME%)", function()
+            return home
+        end)
+        :gsub("%$%(CWD%)", function()
+            return cwd
+        end)
+    local mod = s:find("%$%b()")
+    if mod then
+        s = s:sub(1, mod - 1)
+    end
+    local slash = s:match(".*()/") -- position of the last slash
+    if not slash then
+        return nil
+    end
+    s = vim.fs.normalize(s:sub(1, slash - 1))
+    return s ~= "" and s or nil
+end
+
+---Directories to offer as ready-made clean targets: the working directory first —
+---named `cwd (…)` so it is obvious that is what it is — then the roots drawn from the
+---setup() config. Returns the paths and the labels to show for them, in step.
+---@param cfg table
+---@return string[] paths, string[] labels
+local function candidate_dirs(cfg)
+    local seen, dirs, labels = {}, {}, {}
+    local function add(d, label)
+        if d and utils.directory_exists(d) and not seen[d] then
+            seen[d] = true
+            dirs[#dirs + 1] = d
+            labels[#labels + 1] = label or d
+        end
+    end
+    local cwd = vim.fs.normalize(vim.fn.getcwd())
+    add(cwd, ("cwd (%s)"):format(cwd))
+    add(base_dir_of(cfg.downloaded_problems_path))
+    add(base_dir_of(cfg.downloaded_contests_directory))
+    for _, p in ipairs(require("tuna.workspace.scaffold").configured_paths(cfg)) do
+        add(base_dir_of(p))
+    end
+    return dirs, labels
+end
+
+---The directory names a scan must not descend into. Dot-directories are always in:
+---their files can never be candidates, so walking them is pure cost — and on a big
+---tree they are the overwhelming majority of it.
+---@param cfg table
+---@return table<string, boolean>
+local function skip_set(cfg)
+    local set = {}
+    for _, name in ipairs((cfg.clean or {}).skip_directories or {}) do
+        set[name] = true
+    end
+    return set
+end
+
+---A `vim.fs.dir` `skip` predicate: false stops the walk descending into that
+---directory, which is the only place pruning actually saves anything. It is handed the
+---path relative to the scan's root (`contest/A/.git`), so the rule is read off the
+---directory's own name, at every depth.
+---@param skips table<string, boolean>
+---@return fun(rel: string): boolean
+local function descend_into(skips)
+    return function(rel)
+        local name = vim.fs.basename(rel)
+        return not (skips[name] or name:sub(1, 1) == ".")
+    end
+end
+
+---A shared allowance of filesystem entries for one run, so a scan aimed at a huge
+---tree gives up instead of locking the editor.
+---@param cfg table
+---@return { used: integer, max: integer, truncated: boolean? }
+local function entry_budget(cfg)
+    return { used = 0, max = (cfg.clean or {}).max_entries or 20000 }
+end
+
+-- What a compiler leaves beside a source file. A bare stem (`main`, from `main.cpp`) is
+-- what every default `compile_command` here produces with `-o $(FNOEXT)`; the rest are
+-- the toolchain leftovers that keep it company, `.dSYM` being a *directory* on macOS.
+local ARTIFACT_EXTS = { exe = true, out = true, o = true, class = true, dSYM = true }
+
+-- The first bytes of a compiled program or object: ELF, Mach-O (32 and 64 bit in either byte
+-- order, and universal, whose magic Java's class files share) and a Windows executable.
+local PROGRAM_MAGIC = {
+    "\127ELF",
+    "\254\237\250\206",
+    "\254\237\250\207",
+    "\206\250\237\254",
+    "\207\250\237\254",
+    "\202\254\186\190",
+    "MZ",
+}
+
+---Whether the file at `full` is a compiled program, read off its first bytes.
+---@param full string
+---@return boolean
+local function is_program(full)
+    local fd = vim.uv.fs_open(full, "r", 0)
+    if not fd then
+        return false
+    end
+    local head = vim.uv.fs_read(fd, 4, 0) or ""
+    vim.uv.fs_close(fd)
+    for _, magic in ipairs(PROGRAM_MAGIC) do
+        if head:sub(1, #magic) == magic then
+            return true
+        end
+    end
+    return false
+end
+
+---The stem of the source a file named `leaf` would be the build of: `main` for `main`,
+---`main.exe` or `main.dSYM`, and for a build written hidden (`-o .$(FNOEXT)`), `.main`.
+---@param leaf string basename
+---@return string?
+local function build_stem(leaf)
+    local name = leaf:match("^%.(.+)$") or leaf
+    local stem, ext = name:match("^(.*)%.([^.]+)$")
+    if stem and not ARTIFACT_EXTS[ext] then
+        return nil
+    end
+    return stem or name
+end
+
+---The builds beside the source at `path`: every compiled program named as its build
+---(`build_stem`), and macOS's `.dSYM` bundle.
+---@param path string
+---@return string[]
+local function builds_of(path)
+    local dir, stem = vim.fs.dirname(path), vim.fs.basename(path):gsub("%.[^.]*$", "")
+    local out = {}
+    local handle = vim.uv.fs_scandir(dir)
+    while handle do
+        local name, typ = vim.uv.fs_scandir_next(handle)
+        if not name then
+            break
+        end
+        local full = dir .. "/" .. name
+        if
+            build_stem(name) == stem
+            and (typ == "file" and is_program(full) or typ == "directory" and name:match("%.dSYM$"))
+        then
+            out[#out + 1] = full
+        end
+    end
+    return out
+end
+
+---The name of the source a build was made from, when that source is gone: a compiled
+---program named as a build (`build_stem`), with no source of that name beside it in a
+---language the scan reads.
+---@param full string
+---@param leaf string its basename
+---@param exts table<string, boolean> `source_exts`
+---@return string? stem
+local function orphaned_build(full, leaf, exts)
+    local stem = build_stem(leaf)
+    if not stem then
+        return nil
+    end
+    local dir = vim.fs.dirname(full)
+    for source_ext in pairs(exts) do
+        if utils.file_exists(dir .. "/" .. stem .. "." .. source_ext) then
+            return nil
+        end
+    end
+    return is_program(full) and stem or nil
+end
+
+---Scan `dir` for unused files, recursing up to `depth` levels (`math.huge` =
+---unlimited). A file counts as unused at similarity `threshold`, and a build as unused once
+---its source is gone (`orphaned_build`).
+---@param dir string
+---@param cfg table
+---@param depth number recursion depth passed to `vim.fs.dir`
+---@param threshold number similarity threshold in [0,1]
+---@return { path: string, rel: string, reason: string, sim: number, pinned: boolean?, build: boolean? }[] files, boolean truncated
+local function scan(dir, cfg, depth, threshold)
+    local exts = source_exts(cfg)
+    local roles = tool_roles(cfg)
+    local skips = skip_set(cfg)
+    local budget = entry_budget(cfg)
+    local cache = {}
+    local out = {}
+    pcall(function()
+        -- `skip` prunes at traversal time, which is the only thing that helps: a
+        -- filter applied to yielded entries has already paid to walk them.
+        for name, typ in vim.fs.dir(dir, { depth = depth, skip = descend_into(skips) }) do
+            budget.used = budget.used + 1
+            if budget.used > budget.max then
+                budget.truncated = true
+                return
+            end
+            local full, leaf = dir .. "/" .. name, name:match("[^/]+$") or name
+            local stem = typ == "file" and orphaned_build(full, leaf, exts)
+            if stem then
+                out[#out + 1] = {
+                    path = full,
+                    rel = name,
+                    reason = "build of " .. stem .. ", whose source is gone",
+                    sim = 1,
+                    build = true,
+                }
+            -- A dotfile may be a hidden build, but it is no template's output.
+            elseif typ == "file" and not leaf:match("^%.") then
+                local ext = name:match("%.([^./]+)$") or ""
+                local base = leaf:gsub("%.[^.]*$", "")
+                if exts[ext] or roles[base] then
+                    local reason, sim = classify(full, ext, base, roles, cfg, threshold, cache)
+                    if reason then
+                        out[#out + 1] = {
+                            path = full,
+                            rel = name,
+                            reason = reason,
+                            sim = sim or 0,
+                            pinned = require("tuna.workspace.recent").is_pinned(full),
+                        }
+                    end
+                end
+            end
+        end
+    end)
+    -- Most-certainly-unused first: a build whose source is gone, which nothing can run
+    -- again, then the closer a file still is to its template, the less of it was ever
+    -- written, so reviewing in decreasing match order front-loads the easy deletions and
+    -- leaves the judgement calls for last. Pinned files come after the rest, together, being
+    -- put aside on purpose. Equal scores fall back to path order, so the list is stable
+    -- between runs.
+    local function group(f)
+        return f.build and 0 or f.pinned and 2 or 1
+    end
+    table.sort(out, function(a, b)
+        if group(a) ~= group(b) then
+            return group(a) < group(b)
+        end
+        if a.sim ~= b.sim then
+            return a.sim > b.sim
+        end
+        return a.rel < b.rel
+    end)
+    return out, budget.truncated == true
+end
+
+--------------------------------------------------------------------------------
+-- Empty-directory pruning
+--------------------------------------------------------------------------------
+
+---Turn a testcase filename format into an anchored Lua pattern: `$(TCNUM)` matches a
+---number, every other `$(...)` matches anything (a source name, typically).
+---@param fmt string
+---@return string
+local function fmt_to_pattern(fmt)
+    local parts, i = {}, 1
+    while true do
+        local s, e = fmt:find("%$%b()", i)
+        if not s then
+            parts[#parts + 1] = escape(fmt:sub(i))
+            break
+        end
+        parts[#parts + 1] = escape(fmt:sub(i, s - 1))
+        parts[#parts + 1] = fmt:sub(s, e) == "$(TCNUM)" and "%d+" or ".-"
+        i = e + 1
+    end
+    return "^" .. table.concat(parts) .. "$"
+end
+
+---Patterns for the files a directory may still hold and still count as "empty": the
+---testcases (every configured storage layout) and the per-problem sidecar. These are
+---data *about* a problem, worthless once its solution is gone.
+---@param cfg table
+---@return string[]
+local function disposable_patterns(cfg)
+    local pats = {}
+    local function add(f)
+        if type(f) == "string" then
+            pats[#pats + 1] = fmt_to_pattern(f)
+        elseif type(f) == "table" then
+            for _, x in ipairs(f) do
+                add(x)
+            end
+        end
+    end
+    add(cfg.testcases_input_file_format)
+    add(cfg.testcases_output_file_format)
+    add(cfg.testcases_single_file_format)
+    add(cfg.testcases_directory_input)
+    add(cfg.testcases_directory_output)
+    add(cfg.problem_store_file or ".tuna.json")
+    return pats
+end
+
+---@param name string basename
+---@param pats string[]
+---@return boolean
+local function is_disposable(name, pats)
+    for _, p in ipairs(pats) do
+        if name:match(p) then
+            return true
+        end
+    end
+    return false
+end
+
+---The directories outside `dir` that the sources in it keep their testcases in: a
+---`testcases_directory` of their own (`tests`, a library's shared folder) and the directory
+---backend's root (`tests`, from `tests/$(TCNUM)`), each read from the config a buffer of that
+---source would get, its `.tuna.lua` included.
+---@param dir string normalized
+---@param ctx { exts: table<string, boolean>, stores: table<string, string[]> }
+---@return string[]
+local function stores_in(dir, ctx)
+    if ctx.stores[dir] then
+        return ctx.stores[dir]
+    end
+    local testcases = require("tuna.problem.testcases")
+    local out, cfg = {}, nil
+    local handle = vim.uv.fs_scandir(dir)
+    while handle do
+        local name, typ = vim.uv.fs_scandir_next(handle)
+        if not name then
+            break
+        end
+        if typ == "file" and ctx.exts[name:match("%.([^.]+)$") or ""] then
+            local file = dir .. "/" .. name
+            cfg = cfg or config.load_local_config_and_extend(dir)
+            local base = vim.fs.normalize(testcases.tc_directory(dir, file, cfg))
+            local nested = (cfg.testcases_directory_format or ""):match("^(.*)/[^/]*%$%(TCNUM%)")
+            nested = nested and utils.eval_string(file, nested)
+            for _, store in ipairs({ base, nested and vim.fs.normalize(base .. "/" .. nested) }) do
+                if store ~= dir then
+                    out[#out + 1] = store
+                end
+            end
+        end
+    end
+    ctx.stores[dir] = out
+    return out
+end
+
+---Whether `dir` holds the testcases of a source still on disk (`stores_in`) in a directory
+---above it, within the scan. Such a folder holds nothing but testcases, like a problem whose
+---solution is gone, and only where it stands tells them apart.
+---@param dir string normalized
+---@param ctx { root: string, exts: table<string, boolean>, stores: table<string, string[]> }
+---@return boolean
+local function holds_live_testcases(dir, ctx)
+    local cur = dir
+    while cur ~= ctx.root and (cur .. "/"):sub(1, #ctx.root + 1) == ctx.root .. "/" do
+        cur = vim.fs.dirname(cur)
+        for _, store in ipairs(stores_in(cur, ctx)) do
+            if (dir .. "/"):sub(1, #store + 1) == store .. "/" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Filesystem roots that belong to the system, not to any problem set. An empty one is
+-- still not tuna's to remove, and a scan started high enough up will walk into them.
+local SYSTEM_DIRS = {
+    "/",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/lib",
+    "/media",
+    "/mnt",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/srv",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/var",
+}
+
+-- The standard directories of a user account, used when the desktop's own record of
+-- them (`user-dirs.dirs`) is unavailable. macOS names are included too: an entry that
+-- doesn't exist on this system simply never matches. Deliberately conservative — these
+-- are routinely empty, which is exactly when they would otherwise be proposed.
+local HOME_DIRS = {
+    "Applications",
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Library",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
+    "Templates",
+    "Videos",
+}
+
+---The user's standard directories, taken from the desktop's own record of them
+---(`$XDG_CONFIG_HOME/user-dirs.dirs`) so localized names — `Scrivania`, `Bureau` — are
+---covered as well, falling back to the conventional English names.
+---@param home string
+---@return string[]
+local function xdg_user_dirs(home)
+    local out = {}
+    local conf = (vim.env.XDG_CONFIG_HOME or (home .. "/.config")) .. "/user-dirs.dirs"
+    for line in (utils.read_file(conf) or ""):gmatch("[^\n]+") do
+        -- XDG_DESKTOP_DIR="$HOME/Desktop"
+        local path = line:match('^%s*XDG_%u+_DIR%s*=%s*"(.-)"')
+        if path then
+            out[#out + 1] = (path:gsub("^%$HOME", home):gsub("^~", home))
+        end
+    end
+    for _, name in ipairs(HOME_DIRS) do
+        out[#out + 1] = home .. "/" .. name
+    end
+    return out
+end
+
+---Directories that must never be offered for deletion: the directory being scanned,
+---the working directory, the directory `:Tuna clean` was launched from, every root
+---configured in `setup()`, the home directory with its standard sub-directories, and
+---the system's own directories. These are places the user (or the OS) works in, not
+---products of a run. Extra paths can be added through `clean.protected_directories`.
+---@param root string the directory being scanned
+---@param cfg table
+---@param bufnr integer?
+---@return table<string, boolean>
+local function protected_directories(root, cfg, bufnr)
+    local set = {}
+    local function add(d)
+        if d and d ~= "" then
+            set[vim.fs.normalize(d)] = true
+        end
+    end
+    add(root)
+    add(vim.fn.getcwd())
+    local home = vim.fs.normalize(utils.expand_home("~"))
+    add(home)
+    for _, d in ipairs(xdg_user_dirs(home)) do
+        add(d)
+    end
+    for _, d in ipairs(SYSTEM_DIRS) do
+        add(d)
+    end
+    for _, d in ipairs((cfg.clean or {}).protected_directories or {}) do
+        add(utils.normalize_path(utils.expand_home(d)))
+    end
+    local name = bufnr and api.nvim_buf_is_valid(bufnr) and api.nvim_buf_get_name(bufnr) or ""
+    if name ~= "" then
+        add(vim.fs.dirname(name))
+    end
+    for _, d in ipairs((candidate_dirs(cfg))) do
+        add(d)
+    end
+    return set
+end
+
+---Walk `dir` bottom-up, collecting the directories that could be removed: one that
+---holds nothing but disposable files and other removable directories. Appending in
+---**post-order** puts children before parents, which is the order they must be
+---decided in — a parent is only really removable once its children are gone.
+---
+---Every verdict is memoized in `ctx.decided`, which is what lets a directory be
+---evaluated from two different starting points (the targeted pass over what the run
+---emptied, and the general sweep) without walking any subtree twice.
+---@param dir string
+---@param ctx { root: string, pats: string[], exts: table<string, boolean>, protected: table<string, boolean>, skips: table<string, boolean>, budget: table, decided: table<string, { removable: boolean, files: integer }>, stores: table<string, string[]> }
+---@param out { path: string, files: integer }[] collected, deepest first
+---@param depth number levels left to descend
+---@return boolean removable whether `dir` itself could go
+---@return integer files how many disposable files it holds, all the way down
+local function collect_prunable(dir, ctx, out, depth)
+    local key = vim.fs.normalize(dir)
+    local memo = ctx.decided[key]
+    if memo then
+        return memo.removable, memo.files
+    end
+    -- Out of depth or out of allowance: nothing was looked at, so nothing may be
+    -- proposed — a directory whose contents are unknown must be assumed to matter.
+    -- This is not a verdict, so it is deliberately not memoized.
+    if depth < 1 or ctx.budget.used > ctx.budget.max then
+        return false, 0
+    end
+    local handle = vim.uv.fs_scandir(dir)
+    if not handle then
+        return false, 0
+    end
+    local removable, files = true, 0
+    while true do
+        local name, typ = vim.uv.fs_scandir_next(handle)
+        if not name then
+            break
+        end
+        ctx.budget.used = ctx.budget.used + 1
+        if ctx.budget.used > ctx.budget.max then
+            ctx.budget.truncated = true
+            return false, 0
+        end
+        local full = dir .. "/" .. name
+        -- Dot-directories are pruned here exactly as in the file scan: they are never
+        -- tuna's to remove, and walking them is what made a scan of a home directory
+        -- burn its whole allowance before reaching anything relevant.
+        if typ == "directory" and not ctx.skips[name] and name:sub(1, 1) ~= "." then
+            local ok, n = collect_prunable(full, ctx, out, depth - 1)
+            if ok then
+                files = files + n -- its count already covers everything below it
+            else
+                removable = false
+            end
+        elseif typ == "directory" or not is_disposable(name, ctx.pats) then
+            removable = false -- a pruned directory, or something worth keeping
+        else
+            files = files + 1
+        end
+    end
+    removable = removable and not ctx.protected[key] and not holds_live_testcases(key, ctx)
+    ctx.decided[key] = { removable = removable, files = files }
+    if removable then
+        out[#out + 1] = { path = dir, files = files }
+    end
+    return removable, files
+end
+
+---Evaluate the directories the run itself emptied, and every directory above them up
+---to the scanned root. This runs *before* the general sweep and reuses its budget:
+---what a run just emptied is the whole point of the pass, so it must be offered even
+---when a huge tree exhausts the allowance long before the sweep could reach it.
+---@param root string
+---@param emptied table<string, boolean> directories that lost a file this run
+---@param ctx table see `collect_prunable`
+---@param out { path: string, files: integer }[]
+local function collect_emptied(root, emptied, ctx, out)
+    local rootdir = vim.fs.normalize(root)
+    local dirs = {}
+    for d in pairs(emptied) do
+        dirs[#dirs + 1] = d
+    end
+    -- Deepest first, so a parent's evaluation finds its children already decided.
+    table.sort(dirs, function(a, b)
+        return #a > #b
+    end)
+    for _, d in ipairs(dirs) do
+        -- Up to but not including the root: the root is protected, and evaluating it
+        -- would mean walking the whole tree — which is the general sweep's job.
+        local cur = vim.fs.normalize(d)
+        while cur ~= rootdir and (cur .. "/"):sub(1, #rootdir + 1) == rootdir .. "/" do
+            collect_prunable(cur, ctx, out, math.huge)
+            local parent = vim.fs.dirname(cur)
+            if parent == cur then
+                break
+            end
+            cur = parent
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Flow
+--------------------------------------------------------------------------------
+
+---@param n integer
+---@return string
+local function plural(n)
+    return n == 1 and "" or "s"
+end
+
+---Write out every modified file buffer. Run once before a clean, because a buffer
+---with unsaved changes *undoes* a deletion: unlinking the file succeeds, but the
+---still-open buffer writes it straight back on the next `:w` (or on exit), so the run
+---would report a file removed that is about to reappear. With nothing left unsaved,
+---a deleted file stays deleted and `drop_buffer` can simply wipe its buffer.
+---@return integer count how many buffers were written
+local function save_all_buffers()
+    local saved = 0
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if
+            vim.api.nvim_buf_is_valid(b)
+            and vim.api.nvim_buf_is_loaded(b)
+            and vim.bo[b].modified
+            and vim.bo[b].buftype == "" -- a real file, not a terminal/quickfix/scratch
+            and vim.api.nvim_buf_get_name(b) ~= ""
+        then
+            local ok = pcall(vim.api.nvim_buf_call, b, function()
+                vim.cmd("silent keepalt write")
+            end)
+            if ok then
+                saved = saved + 1
+            end
+        end
+    end
+    return saved
+end
+
+---After a file is deleted from disk, drop the buffer still backing it so the user
+---isn't left editing a phantom — and, more importantly, so nothing can write the file
+---back. This is what makes `:Tuna clean` robust when it deletes the very file it was
+---launched from. Everything was saved up front, so there is never unsaved work here.
+---@param path string absolute path of the deleted file
+local function drop_buffer(path)
+    path = vim.fs.normalize(path)
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(b) and vim.fs.normalize(vim.api.nvim_buf_get_name(b)) == path then
+            pcall(vim.api.nvim_buf_delete, b, { force = true })
+            return
+        end
+    end
+end
+
+---The confirmation title for a single candidate, e.g.
+---`[2/7] 100% match to solution template`. The file itself is named by the preview
+---pane's title just below, so repeating it here would only crowd the prompt. A pinned
+---problem says so first: it was put aside to solve later, which is exactly what an untouched
+---template looks like.
+---@param files { path: string, rel: string, reason: string, sim: number, pinned: boolean? }[]
+---@param i integer
+---@return string
+local function confirm_title(files, i)
+    local f = files[i]
+    return ("[%d/%d] %s%s"):format(i, #files, f.pinned and "pinned, " or "", f.reason)
+end
+
+---What a file's prompt shows below it: the file, or for a build, which has no text, how big
+---and how old it is.
+---@param f { path: string, rel: string, build: boolean? }
+---@return table preview
+local function file_preview(f)
+    local stat = f.build and vim.uv.fs_stat(f.path)
+    local about = stat
+        and ("A compiled program, %d KiB, built %s."):format(
+            math.ceil(stat.size / 1024),
+            os.date("%Y-%m-%d %H:%M", stat.mtime.sec)
+        )
+    return {
+        title = f.rel,
+        lines = about and { about } or vim.split(utils.read_file(f.path) or "", "\n", { plain = true }),
+        filetype = not f.build and vim.filetype.match({ filename = f.path }) or nil,
+    }
+end
+
+---Confirm and delete the candidate files one at a time, via a menu per file.
+---@param files { path: string, rel: string, reason: string, sim: number, pinned: boolean?, build: boolean? }[]
+---@param i integer index into `files`
+---@param restore integer? window to refocus after each menu
+---@param stats { deleted: integer, builds: integer, dirs: integer, emptied: table<string, boolean>, stopped: boolean? }
+---@param ui { width: integer, notice: table?, row: integer? } fixed menu width shared by every file
+---  this run, plus an optional notice pane shown above each prompt
+---@param done fun() continuation, run once the last file has been decided
+local function confirm_each(files, i, restore, stats, ui, done)
+    if i > #files then
+        return done()
+    end
+    local f = files[i]
+    -- Read now rather than kept from the pass's start, which only measured it: scroll it with
+    -- <C-d>/<C-u>, or step into it with the pane-switch keys (`switch_window_keys`).
+    local preview = file_preview(f)
+    preview.width = ui.width
+    -- A pinned file starts on Keep, whatever was answered last: a run of Deletes must not carry
+    -- a problem put aside on purpose along with it.
+    local start = f.pinned and 2 or ui.row
+    widgets.menu({ "Delete", "Keep", "Stop" }, confirm_title(files, i), function(idx)
+        -- The next prompt starts on this answer, so a run of the same one is a key each.
+        ui.row = idx
+        if idx == 3 then -- Stop
+            stats.stopped = true
+            return done()
+        end
+        if idx == 1 then -- Delete
+            if utils.delete_file(f.path) then
+                -- Remember what this emptied: the directory pass starts from here, so
+                -- what the run itself hollowed out is offered even when the general
+                -- sweep is too big to finish.
+                local into = vim.fs.normalize(vim.fs.dirname(f.path))
+                stats.emptied[into] = true
+                if f.build then
+                    stats.builds = stats.builds + 1
+                else
+                    stats.deleted = stats.deleted + 1
+                    drop_buffer(f.path)
+                    require("tuna.workspace.recent").unpin(f.path)
+                    -- Its builds go with it: nothing can rebuild them, and left behind they
+                    -- would keep the directory from being offered.
+                    for _, build in ipairs(builds_of(f.path)) do
+                        if vim.fn.delete(build, "rf") == 0 and not build:match("%.dSYM$") then
+                            stats.builds = stats.builds + 1
+                        end
+                    end
+                end
+            else
+                utils.notify("clean: could not delete " .. f.rel .. ".", "WARN")
+            end
+        end
+        confirm_each(files, i + 1, restore, stats, ui, done) -- idx 2 (Keep) lands here too
+    end, restore, nil, preview, ui.notice, start)
+end
+
+---Wipe the buffers backing anything inside a directory that is about to be removed,
+---so nothing is left that could write a file back into it (see `drop_buffer`).
+---@param dir string
+local function drop_buffers_under(dir)
+    local prefix = vim.fs.normalize(dir) .. "/"
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_valid(b) then
+            local name = vim.api.nvim_buf_get_name(b)
+            if name ~= "" and vim.fs.normalize(name):sub(1, #prefix) == prefix then
+                pcall(vim.api.nvim_buf_delete, b, { force = true })
+            end
+        end
+    end
+end
+
+---Everything still inside a directory, as relative paths, to preview what removing it
+---would take with it. Bounded, since the pane only shows so much anyway.
+---@param dir string
+---@return string[]
+local function dir_listing(dir)
+    local out = {}
+    pcall(function()
+        for name, typ in vim.fs.dir(dir, { depth = 8 }) do
+            out[#out + 1] = typ == "directory" and (name .. "/") or name
+            if #out >= 200 then
+                return
+            end
+        end
+    end)
+    table.sort(out)
+    if #out == 0 then
+        out[1] = "(empty)"
+    end
+    return out
+end
+
+---@param d { path: string, files: integer }
+---@return string
+local function prune_reason(d)
+    if d.files == 0 then
+        return "empty directory"
+    end
+    return ("only testcases/metadata left (%d file%s)"):format(d.files, plural(d.files))
+end
+
+---Confirm and remove the removable directories one at a time, deepest first.
+---Keeping one takes its ancestors out of the running: they still hold it, so they are
+---no longer empty. Deleting one leaves its ancestors as candidates, which is what
+---makes a whole tree collapse in a single pass — problems, then their contest, then
+---the directory holding the contests.
+---@param dirs { path: string, rel: string, files: integer, skip: boolean? }[]
+---@param i integer
+---@param restore integer?
+---@param stats { deleted: integer, dirs: integer, stopped: boolean? }
+---@param ui { width: integer, notice: table?, row: integer? }
+---@param done fun()
+local function confirm_dirs(dirs, i, restore, stats, ui, done)
+    if i > #dirs then
+        return done()
+    end
+    local d = dirs[i]
+    if d.skip then
+        return confirm_dirs(dirs, i + 1, restore, stats, ui, done)
+    end
+    -- Listed now: a child the pass has deleted since its start is gone from it.
+    local preview = { title = d.rel .. "/", lines = dir_listing(d.path), width = ui.width }
+    local title = ("[%d/%d] %s"):format(i, #dirs, prune_reason(d))
+    widgets.menu({ "Delete", "Keep", "Stop" }, title, function(idx)
+        ui.row = idx -- the next prompt starts on this answer, as in `confirm_each`
+        if idx == 3 then -- Stop
+            stats.stopped = true
+            return done()
+        end
+        if idx == 1 then -- Delete
+            drop_buffers_under(d.path)
+            if vim.fn.delete(d.path, "rf") == 0 then
+                stats.dirs = stats.dirs + 1
+            else
+                utils.notify("clean: could not delete " .. d.rel .. "/.", "WARN")
+            end
+        else -- Keep: this directory survives, so nothing above it can be empty
+            local kept = d.path .. "/"
+            for j = i + 1, #dirs do
+                local ancestor = dirs[j].path .. "/"
+                if kept:sub(1, #ancestor) == ancestor then
+                    dirs[j].skip = true
+                end
+            end
+        end
+        confirm_dirs(dirs, i + 1, restore, stats, ui, done)
+    end, restore, nil, preview, ui.notice, ui.row)
+end
+
+---The pane shown above every confirmation when a scan could not cover its whole tree,
+---so the caveat sits in front of the user at the moment of deciding instead of being a
+---command-line line they have already scrolled past.
+---@param stats { truncated: boolean? }
+---@param dir string
+---@param cfg table
+---@return { title: string, lines: string[] }?
+local function truncation_notice(stats, dir, cfg)
+    if not stats.truncated then
+        return nil
+    end
+    return {
+        title = "Partial scan",
+        lines = {
+            ("'%s' holds more than %d entries, so only part of it was searched."):format(
+                dir,
+                (cfg.clean or {}).max_entries or 20000
+            ),
+            "Scan a narrower directory, or lower the recursion depth, to cover the rest.",
+        },
+    }
+end
+
+---Offer to remove the directories left empty — either found that way or emptied by
+---the file pass just run.
+---@param root string
+---@param cfg table
+---@param bufnr integer?
+---@param restore integer?
+---@param stats { deleted: integer, builds: integer, dirs: integer, emptied: table<string, boolean>, stopped: boolean?, truncated: boolean?, found: integer? }
+---@param depth number how far the file scan reached, so both passes cover the same area
+---@param done fun()
+local function prune_dirs(root, cfg, bufnr, restore, stats, depth, done)
+    if stats.stopped then
+        return done()
+    end
+    local found = {}
+    local ctx = {
+        root = vim.fs.normalize(root),
+        pats = disposable_patterns(cfg),
+        exts = source_exts(cfg),
+        protected = protected_directories(root, cfg, bufnr),
+        skips = skip_set(cfg),
+        budget = entry_budget(cfg),
+        decided = {},
+        stores = {},
+    }
+    -- What the run emptied first, the general sweep for already-empty directories
+    -- second: both share one allowance, and this is the order of decreasing certainty
+    -- that the user wants to hear about it.
+    collect_emptied(root, stats.emptied or {}, ctx, found)
+    collect_prunable(root, ctx, found, depth)
+    stats.truncated = stats.truncated or ctx.budget.truncated
+    -- Deepest first across both passes, so a directory is always decided before the one
+    -- holding it: deleting a parent takes its children with it, and keeping a child
+    -- rules its parents out.
+    table.sort(found, function(a, b)
+        local da, db = select(2, a.path:gsub("/", "")), select(2, b.path:gsub("/", ""))
+        if da ~= db then
+            return da > db
+        end
+        return a.path < b.path
+    end)
+    stats.found = (stats.found or 0) + #found
+    if #found == 0 then
+        return done()
+    end
+    local titles, previews = {}, {}
+    for i, d in ipairs(found) do
+        d.rel = d.path:sub(#root + 2) -- path relative to the scanned root
+        titles[i] = ("[%d/%d] %s"):format(i, #found, prune_reason(d))
+        previews[i] = { title = d.rel .. "/", lines = dir_listing(d.path) }
+    end
+    confirm_dirs(found, 1, restore, stats, {
+        width = widgets.sequence_width(titles, previews),
+        notice = truncation_notice(stats, root, cfg),
+    }, done)
+end
+
+-- Recursion-depth choices (default first); the form appends an editable row for any
+-- other depth.
+local DEPTH_CHOICES = {
+    { "Infinite (all subdirectories)", math.huge },
+    { "Only this directory", 1 },
+}
+
+-- Similarity-threshold choices (default first); the form appends an editable row for
+-- any other percentage. A file is unused when its similarity to the template is at
+-- least this.
+local THRESHOLD_CHOICES = {
+    { "Full match (100%)", 1.0 },
+    { "95% match", 0.95 },
+}
+
+---How a depth reads in a message.
+---@param depth number
+---@return string
+local function depth_label(depth)
+    return depth == math.huge and "infinite" or tostring(math.floor(depth))
+end
+
+---How a threshold reads in a message.
+---@param threshold number
+---@return string
+local function threshold_label(threshold)
+    return ("%d%%"):format(math.floor(threshold * 100 + 0.5))
+end
+
+-- Validators for the form's editable rows: each turns the typed text into the value
+-- the scan needs, or returns an error that keeps the form open for a correction.
+
+---@param text string
+---@return string?, string?
+local function validate_dir(text)
+    text = vim.trim(text)
+    if text == "" then
+        return nil, "clean: enter a directory to scan."
+    end
+    local dir = utils.normalize_path(utils.expand_home(text))
+    if not utils.directory_exists(dir) then
+        return nil, "clean: '" .. dir .. "' is not a directory."
+    end
+    return dir
+end
+
+---@param text string
+---@return number?, string?
+local function validate_depth(text)
+    text = vim.trim(text)
+    if text == "" then
+        return nil, "clean: enter a recursion depth (a number ≥ 1)."
+    end
+    local d = tonumber(text)
+    if not d or d < 1 then
+        return nil, "clean: '" .. text .. "' is not a valid depth (a number ≥ 1)."
+    end
+    return math.floor(d)
+end
+
+---@param text string
+---@return number?, string?
+local function validate_threshold(text)
+    text = vim.trim(text)
+    if text == "" then
+        return nil, "clean: enter a match threshold (a percent 1-100)."
+    end
+    local p = tonumber((text:gsub("%%", "")))
+    if not p or p <= 0 or p > 100 then
+        return nil, "clean: '" .. text .. "' is not a valid percentage (1-100)."
+    end
+    return p / 100
+end
+
+---Scan `dir`, drive the per-file confirmation menus, then offer to remove whatever
+---directories that left empty.
+---@param dir string
+---@param cfg table
+---@param restore integer?
+---@param depth number recursion depth
+---@param threshold number similarity threshold in [0,1]
+---@param bufnr integer? the buffer `:Tuna clean` was launched from
+local function scan_and_confirm(dir, cfg, restore, depth, threshold, bufnr)
+    dir = utils.normalize_path(utils.expand_home(dir))
+    if not utils.directory_exists(dir) then
+        utils.notify("clean: '" .. dir .. "' is not a directory.")
+        return
+    end
+    local stats = { deleted = 0, builds = 0, dirs = 0, emptied = {} }
+
+    local function report()
+        if stats.deleted == 0 and stats.builds == 0 and stats.dirs == 0 then
+            if stats.stopped then
+                utils.notify("clean: stopped, nothing removed.", "INFO")
+                return
+            end
+            -- Something was offered and every one of it was kept: that is a different
+            -- outcome from having found nothing, and saying otherwise would be wrong.
+            if (stats.found or 0) > 0 then
+                utils.notify("clean: nothing removed, every candidate was kept.", "INFO")
+                return
+            end
+            -- Finding nothing is a perfectly good outcome — the command is also how one
+            -- checks whether there is anything to clean at all — so this is informational.
+            -- It still reports the whole search, not just where it started, since a
+            -- narrow depth or a strict threshold is the other reason a run comes up empty.
+            utils.notify(
+                ("clean: no unused files found in %s (depth: %s, match threshold: %s)%s."):format(
+                    dir,
+                    depth_label(depth),
+                    threshold_label(threshold),
+                    stats.truncated and ", but only part of it was scanned" or ""
+                ),
+                "INFO"
+            )
+            return
+        end
+        -- "source files" rather than plain "files": removing a directory takes its
+        -- testcases and metadata with it, so only the first count is about code.
+        local parts = {}
+        if stats.deleted > 0 then
+            parts[#parts + 1] = ("%d source file%s"):format(stats.deleted, plural(stats.deleted))
+        end
+        if stats.builds > 0 then
+            parts[#parts + 1] = ("%d build%s"):format(stats.builds, plural(stats.builds))
+        end
+        if stats.dirs > 0 then
+            parts[#parts + 1] = ("%d director%s"):format(stats.dirs, stats.dirs == 1 and "y" or "ies")
+        end
+        local last = table.remove(parts)
+        utils.notify(
+            ("clean: %sremoved %s%s."):format(
+                stats.stopped and "stopped, " or "",
+                #parts > 0 and table.concat(parts, ", ") .. " and " .. last or last,
+                stats.truncated and " (only part of the directory was scanned)" or ""
+            ),
+            "INFO"
+        )
+    end
+
+    -- Directories are decided after the files, since that is what empties them.
+    local function then_dirs()
+        prune_dirs(dir, cfg, bufnr, restore, stats, depth, report)
+    end
+
+    local files, truncated = scan(dir, cfg, depth, threshold)
+    stats.truncated, stats.found = truncated, #files
+    if #files == 0 then
+        then_dirs() -- nothing to delete, but directories may already be empty
+    else
+        -- A partial scan is reported as a pane above each prompt (see
+        -- `truncation_notice`), not as a command-line message.
+        local titles, previews = {}, {}
+        for i, f in ipairs(files) do
+            titles[i], previews[i] = confirm_title(files, i), file_preview(f)
+        end
+        confirm_each(files, 1, restore, stats, {
+            width = widgets.sequence_width(titles, previews),
+            notice = truncation_notice(stats, dir, cfg),
+        }, then_dirs)
+    end
+end
+
+-- The pure deciders, exposed for the test suite: reaching them through
+-- `M.clean` would mean driving a chooser form and a confirmation per file. Not part of
+-- the plugin's interface.
+M._test = {
+    base_dir_of = base_dir_of,
+    scan = scan,
+    validate_dir = validate_dir,
+    classify = classify,
+    templates_of = templates_of,
+    similarity = similarity,
+    prune_dirs = prune_dirs,
+    confirm_each = confirm_each,
+    confirm_dirs = confirm_dirs,
+}
+
+---Entry point for `:Tuna clean`. Choose a directory, recursion depth, and match
+---threshold together (one form, all three lists visible), then confirm each unused
+---file before deleting it.
+---@param bufnr integer? defaults to the current buffer
+function M.clean(bufnr)
+    bufnr = bufnr or api.nvim_get_current_buf()
+    config.load_buffer_config(bufnr)
+    local cfg = config.get_buffer_config(bufnr)
+    local restore = api.nvim_get_current_win()
+
+    -- Nothing may be left unsaved: an open buffer with pending changes writes a
+    -- deleted file back, so a clean would report removals that quietly undo themselves.
+    local saved = save_all_buffers()
+    if saved > 0 then
+        utils.notify(("clean: saved %d modified buffer%s first."):format(saved, plural(saved)), "INFO")
+    end
+
+    local dirs, dir_labels = candidate_dirs(cfg)
+    local function labels_of(choices)
+        local out = {}
+        for i, c in ipairs(choices) do
+            out[i] = c[1]
+        end
+        return out
+    end
+
+    -- Directory, recursion depth and match threshold are chosen together, all three
+    -- lists visible at once (`switch_window_keys` switch lists, <CR> submits).
+    -- Each list ends in an empty `Custom:` row typed into in place, so customizing one
+    -- costs no extra prompt and several can be set before submitting.
+    widgets.form(
+        {
+            {
+                title = "Directory",
+                items = dir_labels,
+                custom = { label = "Custom: ", default = "", validate = validate_dir },
+            },
+            {
+                title = "Recursion depth",
+                items = labels_of(DEPTH_CHOICES),
+                custom = { label = "Custom: ", default = "", validate = validate_depth },
+            },
+            {
+                title = "Match threshold",
+                items = labels_of(THRESHOLD_CHOICES),
+                custom = { label = "Custom: ", default = "", validate = validate_threshold },
+            },
+        },
+        function(results)
+            -- A section's `custom` is set (and already validated) when its editable
+            -- row was the selection; otherwise the choice is the fixed one at `index`.
+            local dir = results[1].custom or dirs[results[1].index]
+            local depth = results[2].custom or DEPTH_CHOICES[results[2].index][2]
+            local threshold = results[3].custom or THRESHOLD_CHOICES[results[3].index][2]
+            scan_and_confirm(dir, cfg, restore, depth, threshold, bufnr)
+        end,
+        restore
+    )
+end
+
+return M

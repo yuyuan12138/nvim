@@ -3,6 +3,8 @@ require('config.options')
 require('config.keymaps')
 require('config.commands')
 
+vim.g.mapleader = " "
+
 vim.cmd('filetype plugin indent on')
 vim.cmd('syntax enable')
 vim.opt.termguicolors = true
