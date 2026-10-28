@@ -5,5 +5,6 @@ require('config.commands')
 
 vim.cmd('filetype plugin indent on')
 vim.cmd('syntax enable')
-
-vim.cmd('colorscheme quiet')
+vim.opt.termguicolors = true
+vim.opt.background = "dark"
+vim.cmd.colorscheme("gruvbox")
