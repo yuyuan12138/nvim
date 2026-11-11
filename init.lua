@@ -9,4 +9,4 @@ vim.cmd('filetype plugin indent on')
 vim.cmd('syntax enable')
 vim.opt.termguicolors = true
 vim.opt.background = "dark"
-vim.cmd.colorscheme("gruvbox")
+vim.cmd.colorscheme("kanagawa")
