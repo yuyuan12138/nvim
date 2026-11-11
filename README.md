@@ -1,137 +1,36 @@
-# Neovim Configuration
+# nvim config — personal Neovim configuration
 
-This directory contains the user configuration for Neovim. Its default location is `~/.config/nvim`.
+## What this is
+Personal Neovim config for `~/.config/nvim`: a small Lua entry point, manual
+package management (no plugin manager), and vendored colorschemes/plugins.
 
-The configuration is written in Lua and follows Neovim's runtime directory conventions.
+## Current status (as of 2026-11-11)
+| Item | State | Source |
+|---|---|---|
+| Entry point | `init.lua` loads `config.options/keymaps/commands`, sets `colorscheme kanagawa` | `init.lua:2-12` |
+| Theme | kanagawa (vendored 2026-11-11, replaced gruvbox) | commit `b22b98b` |
+| Plugin | tuna.nvim vendored under `pack/plugins/start/` | commit `38616d0` |
+| Plugin manager | none — native `pack/*/start/` loading only | `init.lua`, `git ls-files pack` (175 files) |
 
-## Directory layout
+## How it works
+`init.lua` requires `lua/config/{options,keymaps,commands}.lua` and applies
+the colorscheme last, overriding `options.lua`'s `colorscheme default`
+fallback.
 
-```text
-~/.config/nvim/
-├── init.lua                  # Configuration entry point
-├── lua/                      # Lua modules loaded with require()
-│   └── config/               # General configuration modules
-│       ├── options.lua       # Editor options
-│       ├── keymaps.lua       # Global keymaps
-│       └── commands.lua      # Global user commands
-├── after/                    # Loaded after the default runtime files
-│   └── ftplugin/             # Filetype-specific configuration
-│       ├── cpp.lua
-│       ├── markdown.lua
-│       ├── python.lua
-│       └── vim.lua
-├── autoload/                 # Vimscript autoload functions
-├── compiler/                 # Compiler definitions for :compiler
-├── doc/                      # Help documentation for :help
-├── ftplugin/                 # Filetype plugin configuration
-├── indent/                   # Filetype-specific indentation scripts
-├── keymap/                   # Custom keyboard layouts
-├── menu/                     # GUI menu definitions
-├── pack/                     # Native package plugins
-├── parser/                   # Tree-sitter parser files
-├── plugin/                   # Scripts loaded automatically at startup
-├── queries/                  # Tree-sitter query files
-├── rplugin/                  # Remote plugin files
-├── spell/                    # Spell-checking dictionaries and rules
-├── syntax/                   # Syntax highlighting files
-└── tutor/                    # Tutor tutorial resources
-```
+## Map of this directory
+| Path | What it is |
+|---|---|
+| `init.lua` | Entry point — startup wiring only |
+| `lua/config/` | options, keymaps, commands modules |
+| `pack/plugins/start/` | Vendored plugins (tuna.nvim), manually updated |
+| `pack/themes/start/` | Vendored colorschemes (kanagawa.nvim) |
+| `after/` + empty runtime dirs | ftplugin overrides; other standard runtime dirs intentionally present, mostly empty |
+| `docs/`, `work/` | Project-space docs layer — describes, never edits live files |
 
-The empty runtime directories are intentionally present. Files should be added only when the corresponding feature is needed.
-
-## Configuration loading
-
-Neovim starts by loading `init.lua`. The entry point loads the general configuration modules:
-
-```lua
-require('config.options')
-require('config.keymaps')
-require('config.commands')
-```
-
-Lua modules live under `lua/`. The directory path maps to the module name. For example:
-
-```lua
-require('config.options')
-```
-
-loads:
-
-```text
-lua/config/options.lua
-```
-
-Filetype configuration is loaded when a matching filetype is detected. The `after/ftplugin/` directory is loaded after Neovim's default filetype configuration, making it suitable for extending or overriding default behavior.
-
-## Current configuration modules
-
-### `lua/config/options.lua`
-
-Defines global editor options, including line numbers, search behavior, case sensitivity, mouse support, clipboard integration, backup and swap-file behavior, undo files, the file search path, and the default color scheme.
-
-Undo files are stored in Neovim's state directory and no longer depend on the old `~/.vim` configuration.
-
-### `lua/config/keymaps.lua`
-
-Defines global keymaps. The current mapping is:
-
-- In Insert mode, `jk` exits to Normal mode.
-
-### `lua/config/commands.lua`
-
-Defines global user commands. The current command is:
-
-- `:MakeTags` recursively runs `ctags -R .` in the current directory.
-
-### `after/ftplugin/cpp.lua`
-
-Applies only to C++ buffers:
-
-- Uses a two-space indentation width.
-- Does not expand tabs.
-- `<F5>` compiles `sol.cpp`.
-- `<F6>` runs `./sol`.
-- `:CpCompile` compiles with `g++` using C++23.
-- `:CpRun` runs the compiled program.
-- `:CP [name.cpp]` creates a C++ contest template.
-
-### Other `after/ftplugin/*.lua` files
-
-- `markdown.lua`: four-space indentation with spaces.
-- `python.lua`: four-space indentation with spaces.
-- `vim.lua`: two-space indentation with spaces.
-
-## Runtime directory reference
-
-These are standard runtime directories supported by Neovim. Most are currently empty, but each is available for future configuration or plugin files.
-
-| Directory | Purpose |
-| --- | --- |
-| `after/` | Overrides or extends files loaded earlier in the runtime path |
-| `autoload/` | On-demand Vimscript functions |
-| `compiler/` | Compiler definitions selected with `:compiler` |
-| `doc/` | Help documentation accessed with `:help` |
-| `ftplugin/` | Filetype-specific plugin configuration |
-| `indent/` | Filetype-specific indentation rules |
-| `keymap/` | Custom keyboard layouts |
-| `menu/` | GUI menu definitions |
-| `pack/` | Native package and plugin directories |
-| `parser/` | Tree-sitter parser files |
-| `plugin/` | Lua or Vimscript files sourced automatically at startup |
-| `queries/` | Tree-sitter highlighting, injection, and folding queries |
-| `rplugin/` | Remote plugin registration files |
-| `spell/` | Spell-checking dictionaries and rules |
-| `syntax/` | Syntax highlighting definitions |
-| `tutor/` | Tutor tutorial resources |
-
-## Adding new configuration
-
-Put general options in `lua/config/options.lua`, global keymaps in `lua/config/keymaps.lua`, and global commands in `lua/config/commands.lua`.
-
-Put filetype-specific settings in `after/ftplugin/<filetype>.lua`, for example:
-
-```text
-after/ftplugin/javascript.lua
-```
-
-Put standalone Lua plugins that should run automatically at startup in `plugin/`. Put reusable functionality that should be loaded on demand in `lua/`, then load it with `require()`.
+## Conventions
+- Docs describe; live files own. Docs work never edits config/runtime files.
+- Decisions: ADR-style, append-only, in `docs/decisions.md`.
+- Task records: `work/<date>-<slug>/RECORD.md`, append-only.
+- Themes/plugins are vendored as plain files; nested `.git` removed before commit.
+- Git: stage explicit paths only, never `git add -A`; no push without approval.
+- Every claim cites a source file/commit or is marked unverified.
