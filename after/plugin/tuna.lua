@@ -1,7 +1,7 @@
 require("tuna").setup({
   compile_command = {
     cpp = {
-      exec = "g++",
+      exec = "/opt/homebrew/bin/g++-15",
       args = {
         "-std=c++23",
         "-O2",
