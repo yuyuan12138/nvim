@@ -42,11 +42,9 @@ vim.api.nvim_buf_create_user_command(0, 'CP', function(command)
   local template = {
     '#include <bits/stdc++.h>',
     '',
-    'using namespace std;',
-    '',
     'int main() {',
-    '\tios::sync_with_stdio(false);',
-    '\tcin.tie(nullptr);',
+    '\tstd::ios::sync_with_stdio(false);',
+    '\tstd::cin.tie(nullptr);',
     '',
     '\treturn 0;',
     '}',
@@ -54,7 +52,7 @@ vim.api.nvim_buf_create_user_command(0, 'CP', function(command)
   vim.api.nvim_buf_set_lines(0, 0, -1, false, template)
   vim.cmd('silent! write')
   vim.cmd('normal! gg')
-  vim.api.nvim_win_set_cursor(0, { 7, 4 })
+  vim.api.nvim_win_set_cursor(0, { 5, 2 })
   vim.notify('已生成 ' .. name)
 end, {
   nargs = '?',
